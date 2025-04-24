@@ -2,8 +2,9 @@
 
 DB_FILE="backup_clients.db"
 FULLPATH="$(realpath "$0")"
+SCRIPT_DIR="$(dirname "$FULLPATH")"
 
-# Initialisiere die SQLite-Datenbank
+# Initialize the SQLite database
 initialize_db() {
     sqlite3 "$DB_FILE" <<EOF
 CREATE TABLE IF NOT EXISTS clients (
@@ -20,10 +21,9 @@ EOF
 CREATE TABLE IF NOT EXISTS backup_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     client_id INTEGER NOT NULL,
-    type TEXT NOT NULL, -- 'dd' oder 'rsync'
     disk TEXT NOT NULL,
     max_backups INTEGER NOT NULL,
-    schedule TEXT NOT NULL, -- 'HH:MM' oder automatisch generiert
+    schedule TEXT NOT NULL, -- 'HH:MM' or auto-generated
     weekdays TEXT DEFAULT 'Mon,Tue,Wed,Thu,Fri',
     FOREIGN KEY (client_id) REFERENCES clients(id)
 );
@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS global_excludes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     exclude_path TEXT NOT NULL UNIQUE
 );
+INSERT OR IGNORE INTO global_excludes (id, exclude_path) VALUES (1, '/proc/*');
+INSERT OR IGNORE INTO global_excludes (id, exclude_path) VALUES (2, '/sys/*');
+INSERT OR IGNORE INTO global_excludes (id, exclude_path) VALUES (3, '/dev/*');
+INSERT OR IGNORE INTO global_excludes (id, exclude_path) VALUES (4, '/run/*');
 EOF
 
     sqlite3 "$DB_FILE" <<EOF
@@ -56,14 +60,14 @@ CREATE TABLE IF NOT EXISTS job_excludes (
 EOF
 }
 
-# Zeige das Hauptmenü
+# Display the main menu
 main_menu() {
     while true; do
         CHOICE=$(whiptail --title "Main Menu" --menu "Choose an option" --cancel-button "Exit" 25 100 16 \
-            "List Clients" "Lists all registered Backup Clients." \
-            "Backup Jobs" "Manage backup jobs for the clients." \
+            "List Clients" "List all registered backup clients." \
+            "Backup Jobs" "Manage backup jobs for clients." \
             "Settings" "Configure backup settings." \
-            "Help" "Show help to this Script." 3>&1 1>&2 2>&3)
+            "Help" "Show script help." 3>&1 1>&2 2>&3)
 
         if [ $? -ne 0 ]; then
             exit 0
@@ -86,61 +90,33 @@ main_menu() {
     done
 }
 
-# Zeige die Hilfe an
+# Show help dialog
 show_help() {
-    whiptail --title "Help (Scroll Me)" --scrolltext --msgbox "This is a script that helps enable image-based and incremental file-based backups of Linux servers. The original focus was on backing up Raspberry Pi devices.
+    whiptail --title "Help" --msgbox "This script assists with image-based and incremental file-based backups of Linux servers. Originally designed for Raspberry Pi devices.
 
-(Note: Image-based backups can take a long time since the entire hard drive, including empty spaces, is scanned. Additionally, the restoration process also takes longer.)
+To begin, register a client by providing a name and IP address. Connections are made via SSH/Rsync. Specify a username with the necessary privileges.
 
-The following describes how to create backups and how to restore them.
+You may either set a password (stored in the database in plaintext) or leave the password blank and use SSH key authentication (Has to be preconfigured).
 
-First, a client must be registered.
-For this, you give the client a name and specify the IP address.
-The connection is established via SSH/Rsync over the IP.
-A username with sufficient privileges to perform the actions must be specified.
-You can either set a password (which is stored in plain text in the sqlite3 database) or you can copy the SSH key beforehand and leave the password field blank when prompted.
+Important settings:
+- Backup Path: Location where backups are stored, organized by CLIENT_NAME/BACKUPFILE.
+- Global Exclusions: Paths excluded from all Rsync backups.
 
-There are some important settings to configure.
+After registering a client, create a job for it.
 
-Backup path:
-This is where all backups are stored, sorted by CLIENT_NAME/BACKUP_TYPE/BACKUPFILE.
-
-Global Exclusions:
-Here, global exclusions for the Rsync job can be defined, which will automatically be applied to all Rsync jobs.
-
-Now you can create jobs for each client. There are essentially two options:
-
-- dd
-- rsync
-
-DD creates an image-based backup and requires the hard drive to be backed up.
-('lsblk' can help here as a command.)
-Additionally, you need to set the weekdays and time for when the backup should run.
-
-To restore a complete hard drive, you can extract the backup file:
-'gzip -d COMPRESSED_IMAGENAME'
-and then clone the image to the hard drive:
-'dd if=/dev/DISKNAME of=.IMAGENAME'
-
-RSYNC creates a file-based backup and can also include job-specific exclusions in addition to the global exclusions.
-For example, you can exclude mounted drives or similar items that should not be backed up.
-You also need to set the weekdays and time for when the backup should run.
-
-For restoration, you can simply copy the files.
-
-Log files with the respective job ID are stored in /tmp and contain errors if there are any." 24 80
+Log files are saved under /tmp with the job ID and contain any errors." 24 80
 }
 
-#####################################
-############## Clients ##############
-#####################################
+##############################################
+############## Client Functions ##############
+##############################################
 
-# Liste alle Clients
+# Liste existing clients
 list_clients() {
     CLIENTS=$(sqlite3 "$DB_FILE" "SELECT id, name, ip FROM clients;")
 
     if [ -z "$CLIENTS" ]; then
-        if whiptail --title "List Clients" --yesno "No clients found. Would you like to add one?" 10 60; then
+        if whiptail --title "List Clients" --yesno "No clients found. Add a new client?" 10 60; then
             add_client
         else
             return
@@ -152,16 +128,17 @@ list_clients() {
         MENU_ENTRIES+=("$ID" "$NAME ($IP)")
     done <<< "$CLIENTS"
 
-    SELECTED=$(whiptail --title "List Clients" --menu "Select a client to edit or delete:" --cancel-button "Back" 25 100 16 "${MENU_ENTRIES[@]}" "Add Client" "Create a new client"  3>&1 1>&2 2>&3)
+    SELECTED=$(whiptail --title "List Clients" --menu "Select a client to edit or delete:" --cancel-button "Back" 25 100 16 "${MENU_ENTRIES[@]}" "Add Client" "Create a new client" 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
     if [ "$SELECTED" == "Add Client" ]; then
         add_client
+        return
     fi
 
     ACTION=$(whiptail --title "Client Action" --menu "What do you want to do with this client?" --cancel-button "Back" 15 60 4 \
-        "Edit" "Edit the client details." \
-        "Delete" "Delete the client from the database." 3>&1 1>&2 2>&3)
+        "Edit" "Modify client details." \
+        "Delete" "Remove client from database." 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
     case $ACTION in
@@ -176,18 +153,19 @@ list_clients() {
     list_clients
 }
 
+# Add a new client
 add_client() {
     NAME=$(whiptail --title "Add Client" --inputbox "Enter client name:" 10 60 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
     while true; do
-        NEW_IP=$(whiptail --title "Add Client" --inputbox "Enter IP address:" 10 60 "$IP" 3>&1 1>&2 2>&3)
+        NEW_IP=$(whiptail --title "Add Client" --inputbox "Enter IP address:" 10 60 3>&1 1>&2 2>&3)
         [ $? -ne 0 ] && return
 
         if is_valid_ip "$NEW_IP"; then
             break
         else
-            whiptail --title "Invalid IP" --msgbox "The entered IP address is not valid. Please enter a valid IPv4 address." 10 60
+            whiptail --title "Invalid IP" --msgbox "Please enter a valid IPv4 address." 10 60
         fi
     done
 
@@ -197,17 +175,16 @@ add_client() {
 
     PASSWORD=""
     while true; do
-        PASSWORD=$(whiptail --title "Add Client" --passwordbox "Enter password (leave blank to use SSH key):" 10 60 3>&1 1>&2 2>&3)
+        PASSWORD=$(whiptail --title "Add Client" --passwordbox "Enter password (leave blank for SSH key):" 10 60 3>&1 1>&2 2>&3)
         [ $? -ne 0 ] && return
 
         if [ -n "$PASSWORD" ]; then
-            CONFIRM_PASSWORD=$(whiptail --title "Add Client" --passwordbox "Confirm password:" 10 60 3>&1 1>&2 2>&3)
-            [ $? -ne 0 ] && return
+            CONFIRM=$(whiptail --title "Confirm Password" --passwordbox "Re-enter password:" 10 60 3>&1 1>&2 2>&3)
 
-            if [ "$PASSWORD" = "$CONFIRM_PASSWORD" ]; then
+            if [ "$PASSWORD" = "$CONFIRM" ]; then
                 break
             else
-                whiptail --title "Add Client" --msgbox "Passwords do not match. Please try again." 10 60
+                whiptail --title "Mismatch" --msgbox "Passwords do not match." 10 60
             fi
         else
             break
@@ -329,7 +306,7 @@ backup_jobs() {
     [ $? -ne 0 ] && return
 
     CLIENT_NAME=$(sqlite3 "$DB_FILE" "SELECT name FROM clients WHERE id = $SELECTED_CLIENT;")
-    JOBS=$(sqlite3 "$DB_FILE" "SELECT id, type, schedule, max_backups, weekdays FROM backup_jobs WHERE client_id = $SELECTED_CLIENT;")
+    JOBS=$(sqlite3 "$DB_FILE" "SELECT id, schedule, max_backups, weekdays FROM backup_jobs WHERE client_id = $SELECTED_CLIENT;")
 
     if [ -z "$JOBS" ]; then
         if whiptail --title "Manage Jobs" --yesno "No backup jobs found for client '$CLIENT_NAME'. Would you like to add one?" 10 60; then
@@ -339,8 +316,8 @@ backup_jobs() {
         fi
     else
         JOBS_MENU=()
-        while IFS="|" read -r JOB_ID JOB_TYPE JOB_SCHEDULE JOB_MAX_BACKUPS WEEKDAYS; do
-            JOBS_MENU+=("$JOB_ID" "Type: $JOB_TYPE | Time: $JOB_SCHEDULE at $WEEKDAYS | Retention: $JOB_MAX_BACKUPS backup(s)")
+        while IFS="|" read -r JOB_ID JOB_SCHEDULE JOB_MAX_BACKUPS WEEKDAYS; do
+            JOBS_MENU+=("$JOB_ID" "Time: $JOB_SCHEDULE at $WEEKDAYS | Retention: $JOB_MAX_BACKUPS backup(s)")
         done <<< "$JOBS"
 
         SELECTED_ACTION=$(whiptail --title "Manage Jobs" --menu "Manage backup jobs for client '$CLIENT_NAME':" --cancel-button "Back" 25 100 16 "${JOBS_MENU[@]}" "Add Job" "Create a new backup job for this client" 3>&1 1>&2 2>&3)
@@ -363,17 +340,13 @@ manage_job_action() {
         return
     fi
 
-    JOB_DETAILS=$(sqlite3 "$DB_FILE" "SELECT type, disk, max_backups, schedule FROM backup_jobs WHERE id = $JOB_ID;")
-    IFS="|" read -r JOB_TYPE DISK MAX_BACKUPS SCHEDULE <<< "$JOB_DETAILS"
+    JOB_DETAILS=$(sqlite3 "$DB_FILE" "SELECT disk, max_backups, schedule FROM backup_jobs WHERE id = $JOB_ID;")
+    IFS="|" read -r DISK MAX_BACKUPS SCHEDULE <<< "$JOB_DETAILS"
 
     MENU_OPTIONS=(
         "Edit" "Edit the job details."
         "Delete" "Delete the job from the database."
     )
-
-    if [[ "$JOB_TYPE" == "rsync" ]]; then
-        MENU_OPTIONS+=("Job Excludes" "Manage exclude paths for specific backup jobs.")
-    fi
 
     ACTION=$(whiptail --title "Job Action" --menu "What do you want to do with this job?" --cancel-button "Back" 15 80 4 "${MENU_OPTIONS[@]}" 3>&1 1>&2 2>&3)
 
@@ -381,7 +354,7 @@ manage_job_action() {
 
     case $ACTION in
         "Edit")
-            edit_job "$JOB_ID" "$JOB_TYPE" "$DISK" "$MAX_BACKUPS" "$SCHEDULE"
+            edit_job "$JOB_ID" "$DISK" "$MAX_BACKUPS" "$SCHEDULE"
             ;;
         "Job Excludes")
             manage_job_excludes "$JOB_ID"
@@ -395,17 +368,8 @@ manage_job_action() {
 add_job() {
     CLIENT_ID="$1"
 
-    BACKUP_TYPE=$(whiptail --title "Add Backup Job" --menu "Choose a backup type for client" 15 80 2 \
-        "dd" "Disk image clone using dd" \
-        "rsync" "File-based incremental backup using rsync" 3>&1 1>&2 2>&3)
+    DISK=$(whiptail --inputbox "Enter disk you want to backup (e.g. sda):" 10 60 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
-
-    if [ $BACKUP_TYPE == "dd" ]; then
-        DISK=$(whiptail --inputbox "Enter disk you want to backup (e.g. sda):" 10 60 3>&1 1>&2 2>&3)
-        [ $? -ne 0 ] && return
-    else
-        DISK=""
-    fi
 
     WEEKDAYS=$(whiptail --title "Select Weekdays" --checklist "Choose days for backup:" 15 80 7 \
         "Mon" "Monday" ON \
@@ -434,8 +398,8 @@ add_job() {
     [ $? -ne 0 ] && return
 
     sqlite3 "$DB_FILE" <<EOF
-INSERT INTO backup_jobs (client_id, type, disk, schedule, max_backups, weekdays)
-VALUES ($CLIENT_ID, "$BACKUP_TYPE", "$DISK", "$SCHEDULE", $RETENTION, "$WEEKDAYS");
+INSERT INTO backup_jobs (client_id, disk, schedule, max_backups, weekdays)
+VALUES ($CLIENT_ID, "$DISK", "$SCHEDULE", $RETENTION, "$WEEKDAYS");
 EOF
 
     update_cron
@@ -447,18 +411,13 @@ EOF
 
 edit_job() {
     JOB_ID="$1"
-    JOB_TYPE="$2"
-    DISK="$3"
-    MAX_BACKUPS="$4"
-    SCHEDULE="$5"
+    DISK="$2"
+    MAX_BACKUPS="$3"
+    SCHEDULE="$4"
     WEEKDAYS=$(sqlite3 "$DB_FILE" "SELECT weekdays FROM backup_jobs WHERE id = $JOB_ID;")
 
-    if [ $JOB_TYPE == "dd" ]; then
-        DISK=$(whiptail --inputbox "Enter disk you want to backup (e.g. sda):" 10 60 "$DISK" 3>&1 1>&2 2>&3)
-        [ $? -ne 0 ] && return
-    else
-        DISK=""
-    fi
+    DISK=$(whiptail --inputbox "Enter disk you want to backup (e.g. sda):" 10 60 "$DISK" 3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
 
     NEW_WEEKDAYS=$(whiptail --title "Edit Weekdays" --checklist "Update days for backup:" 15 80 7 \
         "Mon" "Monday" $(echo "$WEEKDAYS" | grep -q "Mon" && echo ON || echo OFF) \
@@ -606,6 +565,7 @@ settings_menu() {
 
 backup_path() {
     BACKUP_PATH=$(sqlite3 "$DB_FILE" "SELECT backup_path FROM settings LIMIT 1;")
+    echo "$BACKUP_PATH"
     if [ -z "$BACKUP_PATH" ]; then
         sqlite3 "$DB_FILE" "INSERT INTO settings (backup_path) VALUES ('/tmp');"
         BACKUP_PATH="/tmp"
@@ -619,7 +579,7 @@ backup_path() {
             break
         else
             if whiptail --title "Invalid Path" --yesno "The specified path does not exist. \nShould "$BACKUP_PATH" be created?" 10 60; then
-                mkdir -p $BACKUP_PATH         
+                mkdir -p $BACKUP_PATH
             fi
         fi
     done
@@ -752,27 +712,26 @@ update_cron() {
 }
 
 generate_rsync_exclude_args() {
-    JOB_ID="$1"
+    local JOB_ID="$1"
+    local EXCLUDE_ARGS=()
 
-    EXCLUDE_ARGS=()
-
-    GLOBAL_EXCLUDES=$(sqlite3 "$DB_FILE" "SELECT exclude_path FROM global_excludes;")
     while IFS= read -r EXCLUDE_PATH; do
-        EXCLUDE_ARGS+=("--exclude=$EXCLUDE_PATH")
-    done <<< "$GLOBAL_EXCLUDES"
+        [[ -z "$EXCLUDE_PATH" ]] && continue
+        EXCLUDE_ARGS+=( "--exclude=$EXCLUDE_PATH" )
+    done < <(sqlite3 "$DB_FILE" "SELECT exclude_path FROM global_excludes;")
 
-    JOB_EXCLUDES=$(sqlite3 "$DB_FILE" "SELECT exclude_path FROM job_excludes WHERE job_id = $JOB_ID;")
     while IFS= read -r EXCLUDE_PATH; do
-        EXCLUDE_ARGS+=("--exclude=$EXCLUDE_PATH")
-    done <<< "$JOB_EXCLUDES"
+        [[ -z "$EXCLUDE_PATH" ]] && continue
+        EXCLUDE_ARGS+=( "--exclude=$EXCLUDE_PATH" )
+    done < <(sqlite3 "$DB_FILE" "SELECT exclude_path FROM job_excludes WHERE job_id = $JOB_ID;")
 
     echo "${EXCLUDE_ARGS[@]}"
 }
 
 run_backup() {
     JOB_ID="$1"
-    JOB=$(sqlite3 "$DB_FILE" "SELECT id, client_id, type, disk, max_backups FROM backup_jobs WHERE id = $JOB_ID;")
-    IFS="|" read -r ID CLIENT_ID TYPE DISK MAX_BACKUPS <<< "$JOB"
+    JOB=$(sqlite3 "$DB_FILE" "SELECT id, client_id, disk, max_backups FROM backup_jobs WHERE id = $JOB_ID;")
+    IFS="|" read -r ID CLIENT_ID DISK MAX_BACKUPS <<< "$JOB"
 
     CLIENT=$(sqlite3 "$DB_FILE" "SELECT name, ip, username, password, ssh_key FROM clients WHERE id = $CLIENT_ID;")
     IFS="|" read -r NAME IP USERNAME PASSWORD SSH_KEY <<< "$CLIENT"
@@ -788,30 +747,25 @@ run_backup() {
         rm "$LOGFILE"
     fi
 
-    if [ "$TYPE" == "dd" ]; then
-        BACKUP_DIR="$BACKUP_PATH/$NAME/dd"
-        mkdir -p $BACKUP_DIR
-        if [ "$SSH_KEY" -eq 1 ]; then
-            ssh $USERNAME@$IP "dd if=/dev/$DISK bs=4M | gzip -1 -" | dd of=$BACKUP_DIR/$NAME-$current_date.img.gz
-        else
-            sshpass -p $PASSWORD ssh $USERNAME@$IP "dd if=/dev/$DISK bs=4M | gzip -1 -" | dd of=$BACKUP_DIR/$NAME-$current_date.img.gz
-        fi
-    elif [ "$TYPE" == "rsync" ]; then
-        BACKUP_DIR="$BACKUP_PATH/$NAME/rsync"
-        mkdir -p $BACKUP_DIR
-        if [ -d "$BACKUP_DIR/$NAME-latest" ]; then
-            tar --absolute-names --use-compress-program=pigz -cf "$BACKUP_DIR/$NAME-$current_date.tar.gz" "$BACKUP_DIR/$NAME-latest"
-        fi
-        EXCLUDE_ARGS=$(generate_rsync_exclude_args "$JOB_ID")
-        EXCLUDE_LINE="${EXCLUDE_ARGS[@]}"
-        if [ "$SSH_KEY" -eq 1 ]; then
-            rsync -ax --delete "${EXCLUDE_ARGS[@]}" "$USERNAME@$IP:/" "$BACKUP_DIR/$NAME-latest"
-        else
-            sshpass -p $PASSWORD rsync -ax --delete "${EXCLUDE_ARGS[@]}" "$USERNAME@$IP:/" "$BACKUP_DIR/$NAME-latest"
-        fi
+    BACKUP_DIR="$BACKUP_PATH/$NAME"
+    mkdir -p $BACKUP_DIR
+    if [ -f "$BACKUP_DIR/$NAME-latest.img" ]; then
+        cp "$BACKUP_DIR/$NAME-latest.img" $BACKUP_DIR/$NAME-$current_date.img
+    fi
+    EXCLUDE_ARGS=( $(generate_rsync_exclude_args "$JOB_ID") )
+    if [ "$SSH_KEY" -eq 1 ]; then
+        /bin/bash "$SCRIPT_DIR/job.sh" \
+          "$USERNAME@$IP" /dev/"$DISK" \
+          "$BACKUP_DIR/$NAME-latest.img" "$BACKUP_DIR" \
+          "" "${EXCLUDE_ARGS[@]}"
+    else
+        /bin/bash "$SCRIPT_DIR/job.sh" \
+          "$USERNAME@$IP" /dev/"$DISK" \
+          "$BACKUP_DIR/$NAME-latest.img" "$BACKUP_DIR" \
+          "$PASSWORD" "${EXCLUDE_ARGS[@]}"
     fi
 
-    cleanup_old_backups "$BACKUP_DIR" "$MAX_BACKUPS" "$TYPE"
+    cleanup_old_backups "$BACKUP_DIR" "$MAX_BACKUPS"
 
     if [ -s "$LOGFILE" ]; then
         MESSAGE=$(<"$LOGFILE")
@@ -831,11 +785,7 @@ run_backup() {
 cleanup_old_backups() {
     BACKUP_DIR="$1"
     MAX_BACKUPS="$2"
-    TYPE="$3"
     TOTAL_BACKUPS=$(find "$BACKUP_DIR" -maxdepth 1 -type f | wc -l)
-    if [ "$TYPE" == "rsync" ]; then
-        MAX_BACKUPS=$(($MAX_BACKUPS - 1))
-    fi
     if [[ "$TOTAL_BACKUPS" -gt "$MAX_BACKUPS" ]]; then
         DELETE_COUNT=$(($TOTAL_BACKUPS - $MAX_BACKUPS))
         find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T+ %p\n' | \
@@ -852,7 +802,7 @@ check_tools() {
     for tool in "${commands[@]}"; do
         if ! command -v "$commands" &> /dev/null; then
             echo "Error: $commands is not installed. Please install it using your package manager."
-            exit 1 
+            exit 1
         fi
     done
 }
