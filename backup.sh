@@ -787,11 +787,11 @@ cleanup_old_backups() {
     MAX_BACKUPS="$2"
     TOTAL_BACKUPS=$(find "$BACKUP_DIR" -maxdepth 1 -type f | wc -l)
     if [[ "$TOTAL_BACKUPS" -gt "$MAX_BACKUPS" ]]; then
-        DELETE_COUNT=$(($TOTAL_BACKUPS - $MAX_BACKUPS))
-        find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T+ %p\n' | \
-        sort | \
+        DELETE_COUNT=$((TOTAL_BACKUPS - MAX_BACKUPS))
+        find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T@ %p\n' | \
+        sort -n | \
         head -n "$DELETE_COUNT" | \
-        awk '{print $2}' | \
+        cut -d' ' -f2- | \
         xargs -r rm -f
     fi
 }
