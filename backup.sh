@@ -791,8 +791,8 @@ cleanup_old_backups() {
     if [[ "$TOTAL_BACKUPS" -gt "$MAX_BACKUPS" ]]; then
         DELETE_COUNT=$((TOTAL_BACKUPS - MAX_BACKUPS))
 
-        echo "Es gibt $TOTAL_BACKUPS Backups, maximal erlaubt sind $MAX_BACKUPS."
-        echo "Lösche die $DELETE_COUNT ältesten Backups in $BACKUP_DIR ..."
+        echo "There are $TOTAL_BACKUPS backups, alloewd are $MAX_BACKUPS."
+        echo "Deleting the $DELETE_COUNT oldest backups in $BACKUP_DIR ..."
 
         find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T@ %p\n' \
             | sort -n \
@@ -803,7 +803,7 @@ cleanup_old_backups() {
                 rm -f "$file"
               done
     else
-        echo "Nothing to delete – there are only $TOTAL_BACKUPS/$MAX_BACKUPS Backups."
+        echo "Nothing to delete – there are only $TOTAL_BACKUPS/$MAX_BACKUPS backups."
     fi
 }
 
