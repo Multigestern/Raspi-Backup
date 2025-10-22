@@ -57,7 +57,21 @@ rsync_remote() {
   else
     rsync_opts+=( --exclude="/proc/*" --exclude="/sys/*" --exclude="/dev/*" --exclude="/run/*" )
   fi
+  
+  rsync_opts+=( --ignore-errors )
+  
   rsync "${rsync_opts[@]}" "$src" "$dst" < /dev/null
+  local rsync_exit=$?
+  
+  case $rsync_exit in
+    0)  return 0 ;;
+    24) echo "Warning: Some files were not transferred (partial success)" 
+        return 0 ;;
+    23) echo "Warning: Partial transfer due to error (disk full)"
+        return 0 ;;
+    *)  echo "Error: rsync failed with exit code $rsync_exit"
+        return 1 ;;
+  esac
 }
 
 get_fs_info() {
@@ -160,6 +174,15 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
     read ORG_LABEL ORG_UUID < <(get_fs_info "$PART_NAME")
     echo "  Original Label: ${ORG_LABEL:-(keins)}, UUID: ${ORG_UUID:-(keins)}"
 
+    if [ -n "$MOUNTPOINT" ]; then
+      SRC_SIZE=$(ssh "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
+      DST_SIZE=$(blockdev --getsize64 "$LOOP_PART")
+      if [ "$SRC_SIZE" -gt "$DST_SIZE" ]; then
+        echo "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
+        echo "         Some files may not be copied due to space constraints"
+      fi
+    fi
+
     case "$FSTYPE" in
       vfat)
         echo "  Formatting as FAT32..."
@@ -228,11 +251,14 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
       echo "  Copying data from remote mountpoint $MOUNTPOINT..."
       TMP_MNT=$(mktemp -d $WORK_DIRECTORY/newpart.XXXXXX)
       mount "$LOOP_PART" "$TMP_MNT"
-      rsync_remote "$REMOTE_HOST:$MOUNTPOINT"/ "$TMP_MNT"/
-      umount "$TMP_MNT"
-      rmdir "$TMP_MNT"
+      if ! rsync_remote "$REMOTE_HOST:$MOUNTPOINT"/ "$TMP_MNT"/; then
+        echo "Warning: Rsync reported warnings/errors but continuing with backup"
+      fi
+      sync
+      umount "$TMP_MNT" || echo "Warning: Failed to unmount $TMP_MNT"
+      rmdir "$TMP_MNT" || echo "Warning: Failed to remove $TMP_MNT"
     else
-      echo "  No mountpoint – skipping data copy."
+      echo "  No mountpoint - skipping data copy."
     fi
 
   done
@@ -284,18 +310,30 @@ else
 
     echo "Updating remote partition /dev/$PART_NAME: fstype=$FSTYPE, mountpoint='$MOUNTPOINT'"
 
+    if [ -n "$MOUNTPOINT" ]; then
+      SRC_SIZE=$(ssh "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
+      DST_SIZE=$(blockdev --getsize64 "$LOOP_PART")
+      if [ "$SRC_SIZE" -gt "$DST_SIZE" ]; then
+        echo "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
+        echo "         Some files may not be copied due to space constraints"
+      fi
+    fi
+
     if [ "$FSTYPE" = "swap" ]; then
       echo "  Swap partition will not be updated."
       continue
     fi
 
     if [ -n "$MOUNTPOINT" ]; then
-      echo "  Updating data from remote mountpoint $MOUNTPOINT..."
+      echo "  Copying data from remote mountpoint $MOUNTPOINT..."
       TMP_MNT=$(mktemp -d $WORK_DIRECTORY/newpart.XXXXXX)
       mount "$LOOP_PART" "$TMP_MNT"
-      rsync_remote "$REMOTE_HOST:$MOUNTPOINT"/ "$TMP_MNT"/
-      umount "$TMP_MNT"
-      rmdir "$TMP_MNT"
+      if ! rsync_remote "$REMOTE_HOST:$MOUNTPOINT"/ "$TMP_MNT"/; then
+        echo "Warning: Rsync reported warnings/errors but continuing with backup"
+      fi
+      sync
+      umount "$TMP_MNT" || echo "Warning: Failed to unmount $TMP_MNT"
+      rmdir "$TMP_MNT" || echo "Warning: Failed to remove $TMP_MNT"
     else
       echo "  No mountpoint – skipping update."
     fi

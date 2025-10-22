@@ -807,7 +807,6 @@ cleanup_old_backups() {
     fi
 }
 
-
 check_tools() {
     commands=("jq" "pigz" "sqlite3" "whiptail" "tar" "ssh" "rsync" "grep" "curl" "sshpass")
 
