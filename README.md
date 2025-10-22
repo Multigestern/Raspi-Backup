@@ -12,4 +12,3 @@ Just run the `run.sh` file to start configuring your backups.
 The database will be initialized when running the script the first time.
 
 If you want to run just a single job manually you can run the `job.sh` script by itself.
-

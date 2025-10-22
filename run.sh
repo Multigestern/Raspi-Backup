@@ -785,16 +785,28 @@ run_backup() {
 cleanup_old_backups() {
     BACKUP_DIR="$1"
     MAX_BACKUPS="$2"
+
     TOTAL_BACKUPS=$(find "$BACKUP_DIR" -maxdepth 1 -type f | wc -l)
+
     if [[ "$TOTAL_BACKUPS" -gt "$MAX_BACKUPS" ]]; then
-        DELETE_COUNT=$(($TOTAL_BACKUPS - $MAX_BACKUPS))
-        find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T+ %p\n' | \
-        sort | \
-        head -n "$DELETE_COUNT" | \
-        awk '{print $2}' | \
-        xargs -r rm -f
+        DELETE_COUNT=$((TOTAL_BACKUPS - MAX_BACKUPS))
+
+        echo "There are $TOTAL_BACKUPS backups, alloewd are $MAX_BACKUPS."
+        echo "Deleting the $DELETE_COUNT oldest backups in $BACKUP_DIR ..."
+
+        find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T@ %p\n' \
+            | sort -n \
+            | head -n "$DELETE_COUNT" \
+            | cut -d' ' -f2- \
+            | while read -r file; do
+                echo "Lösche: $file"
+                rm -f "$file"
+              done
+    else
+        echo "Nothing to delete – there are only $TOTAL_BACKUPS/$MAX_BACKUPS backups."
     fi
 }
+
 
 check_tools() {
     commands=("jq" "pigz" "sqlite3" "whiptail" "tar" "ssh" "rsync" "grep" "curl" "sshpass")
