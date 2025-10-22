@@ -49,6 +49,32 @@ else
 fi
 export RSYNC_RSH="$SSH_CMD"
 
+# Color definitions
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+ORANGE='\033[0;33m'
+NC='\033[0m'
+
+log_step() {
+    local step="$1"
+    local message="$2"
+    echo -e "${GREEN}[STEP $step]${NC} $message"
+}
+
+log_done() {
+    echo -e "${GREEN}   ✔${NC} Done"
+}
+
+log_error() {
+    local message="$1"
+    echo -e "${RED}Error:${NC} $message"
+}
+
+log_warning() {
+    local message="$1"
+    echo -e "${ORANGE}Warning:${NC} $message"
+}
+
 rsync_remote() {
   local src="$1" dst="$2"
   local rsync_opts=( -aAX --inplace --delete )
@@ -58,19 +84,27 @@ rsync_remote() {
     rsync_opts+=( --exclude="/proc/*" --exclude="/sys/*" --exclude="/dev/*" --exclude="/run/*" )
   fi
   
-  rsync_opts+=( --ignore-errors )
+  # Add these options for better handling of errors
+  rsync_opts+=( 
+    --ignore-errors 
+    --partial
+    --no-whole-file
+  )
   
   rsync "${rsync_opts[@]}" "$src" "$dst" < /dev/null
   local rsync_exit=$?
   
   case $rsync_exit in
     0)  return 0 ;;
-    24) echo "Warning: Some files were not transferred (partial success)" 
-        return 0 ;;
-    23) echo "Warning: Partial transfer due to error (disk full)"
-        return 0 ;;
-    *)  echo "Error: rsync failed with exit code $rsync_exit"
-        return 1 ;;
+    23|24) 
+      log_warning "Warning: Partial transfer (some files not copied, possibly due to space constraints)"
+      return 0 ;;
+    11) 
+      log_warning "Warning: Some files were not copied due to space constraints"
+      return 0 ;;
+    *)  
+      log_error "Error: rsync failed with exit code $rsync_exit"
+      return 1 ;;
   esac
 }
 
@@ -89,35 +123,58 @@ check_tools() {
 
     for tool in "${commands[@]}"; do
         if ! command -v "$commands" &> /dev/null; then
-            echo "Error: $commands is not installed. Please install it using your package manager."
+            log_error "Error: $commands is not installed. Please install it using your package manager."
             exit 1
         fi
     done
 }
 
+mount_partition() {
+  local part="$1"
+  local mountpoint="$2"
+  local fstype="$3"
+  
+  case "$fstype" in
+    vfat)
+      mount -t vfat -o codepage=437,iocharset=ascii,shortname=mixed,utf8 "$part" "$mountpoint"
+      ;;
+    ext4|ext3|ext2)
+      mount -t "$fstype" "$part" "$mountpoint"
+      ;;
+    *)
+      mount "$part" "$mountpoint"
+      ;;
+  esac
+}
+
+log_step 1 "Checking required tools"
 check_tools
+log_done
 
 if [ ! -f "$OUTPUT_IMAGE" ]; then
   ##########################
   # Performing full backup #
   ##########################
-  echo "Creating full backup image for remote device $REMOTE_DEV on $REMOTE_HOST ..."
+  log_step 2 "Creating full backup image for remote device $REMOTE_DEV on $REMOTE_HOST ..."
   echo "Target image: $OUTPUT_IMAGE"
 
   IMAGE_SIZE=$(ssh "$REMOTE_HOST" "sudo blockdev --getsize64 $REMOTE_DEV")
   echo "Size of the remote device: $IMAGE_SIZE Bytes"
 
-  echo "Create emptry image..."
+  log_step 3 "Create emptry image..."
   if command -v fallocate &>/dev/null; then
     fallocate -l "$IMAGE_SIZE" "$OUTPUT_IMAGE"
   else
     dd if=/dev/zero of="$OUTPUT_IMAGE" bs=1 count=0 seek="$IMAGE_SIZE"
   fi
+  log_done
 
+  log_step 4 "Exporting partition table from remote device..."
   TMP_PART_TABLE=$(mktemp $WORK_DIRECTORY/partition_table.XXXXXX)
   ssh "$REMOTE_HOST" "sudo sfdisk -d $REMOTE_DEV" > "$TMP_PART_TABLE"
-  echo "Partition table exported from remote device."
+  log_done
 
+  log_step 5 "Creating partitions and formatting them..."
   LOOPDEV=$(losetup -f --show "$OUTPUT_IMAGE")
   echo "Image mounted as loop device: $LOOPDEV"
 
@@ -129,7 +186,7 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
     if command -v partx >/dev/null 2>&1; then
       partx -a "$LOOPDEV" 2>/dev/null || true
     else
-      echo "Warning: Neither partprobe nor partx found. Please reload the partition table manually."
+      log_warning "Warning: Neither partprobe nor partx found. Please reload the partition table manually."
     fi
   fi
   sleep 2
@@ -178,7 +235,7 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
       SRC_SIZE=$(ssh "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
       DST_SIZE=$(blockdev --getsize64 "$LOOP_PART")
       if [ "$SRC_SIZE" -gt "$DST_SIZE" ]; then
-        echo "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
+        log_warning "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
         echo "         Some files may not be copied due to space constraints"
       fi
     fi
@@ -250,21 +307,28 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
     if [ -n "$MOUNTPOINT" ]; then
       echo "  Copying data from remote mountpoint $MOUNTPOINT..."
       TMP_MNT=$(mktemp -d $WORK_DIRECTORY/newpart.XXXXXX)
-      mount "$LOOP_PART" "$TMP_MNT"
+      if ! mount_partition "$LOOP_PART" "$TMP_MNT" "$FSTYPE"; then
+        log_warning "Warning: Failed to mount $LOOP_PART, skipping"
+        rmdir "$TMP_MNT"
+        continue
+      fi
       if ! rsync_remote "$REMOTE_HOST:$MOUNTPOINT"/ "$TMP_MNT"/; then
-        echo "Warning: Rsync reported warnings/errors but continuing with backup"
+        log_warning "Warning: Rsync reported warnings/errors but continuing with backup"
       fi
       sync
-      umount "$TMP_MNT" || echo "Warning: Failed to unmount $TMP_MNT"
-      rmdir "$TMP_MNT" || echo "Warning: Failed to remove $TMP_MNT"
+      umount "$TMP_MNT" || log_warning "Warning: Failed to unmount $TMP_MNT"
+      rmdir "$TMP_MNT" || log_warning "Warning: Failed to remove $TMP_MNT"
     else
       echo "  No mountpoint - skipping data copy."
     fi
 
   done
+  log_done
 
+  log_step 6 "Cleaning up..."
   rm -f "$TMP_PART_TABLE" "$MAPFILE"
   losetup -d "$LOOPDEV"
+  log_done
 
   echo "Done! The full backup has been created: $OUTPUT_IMAGE"
 
@@ -272,10 +336,11 @@ else
   #################################
   # Performing incremental backup #
   #################################
-  echo "Incremental backup: Updating existing image $OUTPUT_IMAGE ..."
+  log_step 2 "Incremental backup: Updating existing image $OUTPUT_IMAGE ..."
 
+  log_step 3 "Mounting image and preparing partition map..."
   LOOPDEV=$(losetup -f --show -P "$OUTPUT_IMAGE")
-  echo "Image mounted as loop device: $LOOPDEV"
+  
 
   MAPFILE=$(mktemp $WORK_DIRECTORY/partition_map.XXXXXX)
   ssh "$REMOTE_HOST" "lsblk -ln -o NAME,MOUNTPOINT,FSTYPE $REMOTE_DEV" | while read -r NAME MOUNT FSTYPE; do
@@ -288,7 +353,9 @@ else
   cat "$MAPFILE"
 
   mapfile -t PARTITIONS < "$MAPFILE"
+  log_done
 
+  log_step 4 "Updating partitions..."
   for LINE in "${PARTITIONS[@]}"; do
     read -r PART_NAME MOUNTPOINT FSTYPE <<< "$LINE"
 
@@ -314,7 +381,7 @@ else
       SRC_SIZE=$(ssh "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
       DST_SIZE=$(blockdev --getsize64 "$LOOP_PART")
       if [ "$SRC_SIZE" -gt "$DST_SIZE" ]; then
-        echo "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
+        log_warning "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
         echo "         Some files may not be copied due to space constraints"
       fi
     fi
@@ -327,21 +394,28 @@ else
     if [ -n "$MOUNTPOINT" ]; then
       echo "  Copying data from remote mountpoint $MOUNTPOINT..."
       TMP_MNT=$(mktemp -d $WORK_DIRECTORY/newpart.XXXXXX)
-      mount "$LOOP_PART" "$TMP_MNT"
+      if ! mount_partition "$LOOP_PART" "$TMP_MNT" "$FSTYPE"; then
+        log_warning "Warning: Failed to mount $LOOP_PART, skipping"
+        rmdir "$TMP_MNT"
+        continue
+      fi
       if ! rsync_remote "$REMOTE_HOST:$MOUNTPOINT"/ "$TMP_MNT"/; then
-        echo "Warning: Rsync reported warnings/errors but continuing with backup"
+        log_warning "Warning: Rsync reported warnings/errors but continuing with backup"
       fi
       sync
-      umount "$TMP_MNT" || echo "Warning: Failed to unmount $TMP_MNT"
-      rmdir "$TMP_MNT" || echo "Warning: Failed to remove $TMP_MNT"
+      umount "$TMP_MNT" || log_warning "Warning: Failed to unmount $TMP_MNT"
+      rmdir "$TMP_MNT" || log_warning "Warning: Failed to remove $TMP_MNT"
     else
       echo "  No mountpoint – skipping update."
     fi
 
   done
+  log_done
 
+  log_step 5 "Cleaning up..."
   rm -f "$MAPFILE"
   losetup -d "$LOOPDEV"
+  log_done
 
   echo "Done! The incremental backup has been updated: $OUTPUT_IMAGE"
 fi

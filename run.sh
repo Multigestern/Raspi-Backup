@@ -1,5 +1,11 @@
 #!/usr/bin/env bash
 
+# Color definitions
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+ORANGE='\033[0;33m'
+NC='\033[0m'
+
 DB_FILE="backup_clients.db"
 FULLPATH="$(realpath "$0")"
 SCRIPT_DIR="$(dirname "$FULLPATH")"
@@ -750,7 +756,9 @@ run_backup() {
     BACKUP_DIR="$BACKUP_PATH/$NAME"
     mkdir -p $BACKUP_DIR
     if [ -f "$BACKUP_DIR/$NAME-latest.img" ]; then
+        echo -e "${GREEN}[STEP 0]${NC} Creating snapshot of latest backup..."
         cp "$BACKUP_DIR/$NAME-latest.img" $BACKUP_DIR/$NAME-$current_date.img
+        echo -e "${GREEN}   ✔ Done${NC}"
     fi
     EXCLUDE_ARGS=( $(generate_rsync_exclude_args "$JOB_ID") )
     if [ "$SSH_KEY" -eq 1 ]; then
@@ -812,7 +820,7 @@ check_tools() {
 
     for tool in "${commands[@]}"; do
         if ! command -v "$commands" &> /dev/null; then
-            echo "Error: $commands is not installed. Please install it using your package manager."
+            echo -e "${RED}Error:${NC} $commands is not installed. Please install it using your package manager."
             exit 1
         fi
     done
