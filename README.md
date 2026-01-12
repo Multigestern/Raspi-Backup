@@ -9,6 +9,8 @@ A small set of Bash scripts to create full and incremental backups of Raspberry 
 - For subsequent runs, update only changed files within mounted partitions using rsync (incremental approach) to minimize transfer time and storage.
 - Manage clients and scheduled backup jobs with a small TUI (`whiptail`).
 - Store client configuration and job schedule metadata in an embedded SQLite database.
+- Backups are performed remotely over SSH — the target device (Raspberry Pi) can remain powered on during the backup; no physical removal of the SD card is required.
+- Backups also work over VPNs or SSH tunnels, so remote Pis (for example in a holiday home or at relatives) can be backed up as long as the controller machine can reach them via SSH.
 
 ## Main Features
 
