@@ -10,6 +10,99 @@ DB_FILE="backup_clients.db"
 FULLPATH="$(realpath "$0")"
 SCRIPT_DIR="$(dirname "$FULLPATH")"
 
+# Encryption helpers
+encrypt_password() {
+    if [ -z "$1" ]; then
+        echo ""
+        return 0
+    fi
+    if [ -z "$RBACKUP_MASTER_KEY" ]; then
+        return 1
+    fi
+    printf '%s' "$1" | openssl enc -aes-256-cbc -a -salt -pbkdf2 -pass env:RBACKUP_MASTER_KEY -A 2>/dev/null
+}
+
+decrypt_password() {
+    if [ -z "$1" ]; then
+        echo ""
+        return 0
+    fi
+    printf '%s' "$1" | openssl enc -d -aes-256-cbc -a -pbkdf2 -pass env:RBACKUP_MASTER_KEY 2>/dev/null
+}
+
+# Wrapping key helpers: derive a machine-specific wrap key to protect the stored master key
+get_machine_uuid() {
+    if command -v ioreg >/dev/null 2>&1; then
+        uuid=$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F\" '/IOPlatformUUID/ {print $4; exit}')
+    fi
+    if [ -z "$uuid" ]; then
+        uuid=$(hostname)
+    fi
+    printf '%s' "$uuid"
+}
+
+derive_wrap_key() {
+    local uuid
+    uuid=$(get_machine_uuid)
+    printf '%s' "$uuid" | sha256sum 2>/dev/null | awk '{print $1}' || printf '%s' "$uuid" | shasum -a 256 | awk '{print $1}'
+}
+
+wrap_master_key() {
+    if [ -z "$1" ]; then
+        echo ""
+        return 0
+    fi
+    local wrap
+    wrap=$(derive_wrap_key)
+    printf '%s' "$1" | openssl enc -aes-256-cbc -a -salt -pbkdf2 -pass pass:"$wrap" -A 2>/dev/null
+}
+
+unwrap_master_key() {
+    if [ -z "$1" ]; then
+        echo ""
+        return 0
+    fi
+    local wrap
+    wrap=$(derive_wrap_key)
+    printf '%s' "$1" | openssl enc -d -aes-256-cbc -a -pbkdf2 -pass pass:"$wrap" 2>/dev/null
+}
+
+load_master_key_from_db() {
+    if [ -n "$RBACKUP_MASTER_KEY" ]; then
+        return 0
+    fi
+    if [ ! -f "$DB_FILE" ]; then
+        return 0
+    fi
+    ENC_KEY=$(sqlite3 "$DB_FILE" "SELECT master_key_encrypted FROM settings LIMIT 1;" 2>/dev/null || echo "")
+    if [ -n "$ENC_KEY" ]; then
+        if [ "$ENC_KEY" != "" ]; then
+            DECRYPTED=$(unwrap_master_key "$ENC_KEY")
+            if [ -n "$DECRYPTED" ]; then
+                export RBACKUP_MASTER_KEY="$DECRYPTED"
+            fi
+        fi
+    fi
+}
+
+store_master_key_to_db() {
+    local plaintext="$1"
+    if [ -z "$plaintext" ]; then
+        sqlite3 "$DB_FILE" "UPDATE settings SET master_key_encrypted = '' WHERE id = 1;"
+        return 0
+    fi
+    local wrapped
+    wrapped=$(wrap_master_key "$plaintext")
+    if [ -n "$wrapped" ]; then
+        sqlite3 "$DB_FILE" "UPDATE settings SET master_key_encrypted = '$wrapped' WHERE id = 1;"
+        return 0
+    else
+        return 1
+    fi
+}
+
+
+
 # Initialize the SQLite database
 initialize_db() {
     sqlite3 "$DB_FILE" <<EOF
@@ -39,10 +132,12 @@ EOF
 CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     backup_path TEXT NOT NULL,
-    notify_url TEXT NOT NULL
+    notify_url TEXT NOT NULL,
+    master_key_encrypted TEXT
 );
 INSERT OR IGNORE INTO settings (id, backup_path) VALUES (1, '/tmp');
 INSERT OR IGNORE INTO settings (id, notify_url) VALUES (1, 'https://example.com');
+INSERT OR IGNORE INTO settings (id, master_key_encrypted) VALUES (1, '');
 EOF
 
     sqlite3 "$DB_FILE" <<EOF
@@ -65,6 +160,8 @@ CREATE TABLE IF NOT EXISTS job_excludes (
 );
 EOF
 }
+
+load_master_key_from_db
 
 # Display the main menu
 main_menu() {
@@ -102,7 +199,7 @@ show_help() {
 
 To begin, register a client by providing a name and IP address. Connections are made via SSH/Rsync. Specify a username with the necessary privileges.
 
-You may either set a password (stored in the database in plaintext) or leave the password blank and use SSH key authentication (Has to be preconfigured).
+You may either set a password (stored encrypted in the database) or leave the password blank and use SSH key authentication (has to be preconfigured).
 
 Important settings:
 - Backup Path: Location where backups are stored, organized by CLIENT_NAME/BACKUPFILE.
@@ -199,13 +296,24 @@ add_client() {
 
     if [ -n "$PASSWORD" ]; then
         USE_SSH_KEY=0
+        if [ -z "$RBACKUP_MASTER_KEY" ]; then
+            whiptail --title "Encryption Key Missing" --msgbox "RBACKUP_MASTER_KEY is not set. Set this environment variable to securely store passwords, or leave the password blank to use SSH key authentication." 12 70
+            return
+        fi
+        ENC_PASS=$(encrypt_password "$PASSWORD")
+        if [ $? -ne 0 ] || [ -z "$ENC_PASS" ]; then
+            whiptail --title "Encryption Failed" --msgbox "Failed to encrypt password. Check that 'openssl' is available and RBACKUP_MASTER_KEY is correct." 12 70
+            return
+        fi
+        STORED_PASSWORD="ENC:$ENC_PASS"
     else
         USE_SSH_KEY=1
+        STORED_PASSWORD=""
     fi
 
     sqlite3 "$DB_FILE" <<EOF
 INSERT INTO clients (name, ip, username, password, ssh_key)
-VALUES ("$NAME", "$NEW_IP", "$USERNAME", "$PASSWORD", $USE_SSH_KEY);
+VALUES ("$NAME", "$NEW_IP", "$USERNAME", "$STORED_PASSWORD", $USE_SSH_KEY);
 EOF
 
     whiptail --title "Add Client" --msgbox "Client added successfully." 10 60
@@ -257,8 +365,19 @@ edit_client() {
     done
 
     if [ -n "$NEW_PASSWORD" ] && [ "$NEW_PASSWORD" != "$PASSWORD" ]; then
+        if [ -z "$RBACKUP_MASTER_KEY" ]; then
+            whiptail --title "Encryption Key Missing" --msgbox "RBACKUP_MASTER_KEY is not set. Set this environment variable to securely store passwords." 12 70
+            return
+        fi
+        ENC_PASS=$(encrypt_password "$NEW_PASSWORD")
+        if [ $? -ne 0 ] || [ -z "$ENC_PASS" ]; then
+            whiptail --title "Encryption Failed" --msgbox "Failed to encrypt password. Check that 'openssl' is available and RBACKUP_MASTER_KEY is correct." 12 70
+            return
+        fi
+        STORED_PASSWORD="ENC:$ENC_PASS"
         USE_SSH_KEY=0
     else
+        STORED_PASSWORD="$PASSWORD"
         USE_SSH_KEY=$SSH_KEY
     fi
 
@@ -267,7 +386,7 @@ UPDATE clients
 SET name = "$NEW_NAME",
     ip = "$NEW_IP",
     username = "$NEW_USERNAME",
-    password = "$NEW_PASSWORD",
+    password = "$STORED_PASSWORD",
     ssh_key = $USE_SSH_KEY
 WHERE id = $CLIENT_ID;
 EOF
@@ -551,7 +670,8 @@ settings_menu() {
         CHOICE=$(whiptail --title "Settings" --menu "Choose an option" --cancel-button "Back" 25 100 16 \
             "Backup Path" "Set the Path, where Backups should be stored." \
             "Notification URL" "Set the URL which should recieve a POST if a Backups has errors." \
-            "Global Exclusions" "Manage Exclusions for the Rsync Backup." 3>&1 1>&2 2>&3)
+            "Global Exclusions" "Manage Exclusions for the Rsync Backup." \
+            "Master Key" "Set or clear the master key used to encrypt SSH passwords." 3>&1 1>&2 2>&3)
 
         [ $? -ne 0 ] && return
 
@@ -565,6 +685,9 @@ settings_menu() {
             "Global Exclusions")
                 manage_global_excludes
                 ;;
+                "Master Key")
+                    master_key_menu
+                    ;;
         esac
     done
 }
@@ -643,6 +766,49 @@ manage_global_excludes() {
                 manage_global_exclude_action "$CHOICE"
             fi
         fi
+    done
+}
+
+master_key_menu() {
+    while true; do
+        CUR_VAL=$(sqlite3 "$DB_FILE" "SELECT master_key_encrypted FROM settings LIMIT 1;" 2>/dev/null || echo "")
+        if [ -z "$CUR_VAL" ]; then
+            DISPLAY="(not set)"
+        else
+            DISPLAY="(stored)"
+        fi
+
+        CHOICE=$(whiptail --title "Master Key" --menu "Master Key is $DISPLAY. Choose an action:" --cancel-button "Back" 15 80 6 \
+            "Set" "Set or update master key (will be stored encrypted)." \
+            "Clear" "Remove stored master key from DB." 3>&1 1>&2 2>&3)
+
+        [ $? -ne 0 ] && return
+
+        case $CHOICE in
+            "Set")
+                MK=$(whiptail --title "Set Master Key" --passwordbox "Enter master key to encrypt SSH passwords (this will be stored encrypted on this machine):" 12 70 3>&1 1>&2 2>&3)
+                [ $? -ne 0 ] && continue
+                CONF=$(whiptail --title "Confirm" --passwordbox "Re-enter master key:" 12 70 3>&1 1>&2 2>&3)
+                [ $? -ne 0 ] && continue
+                if [ "$MK" != "$CONF" ]; then
+                    whiptail --title "Mismatch" --msgbox "Master keys do not match." 10 60
+                    continue
+                fi
+                if store_master_key_to_db "$MK"; then
+                    whiptail --title "Saved" --msgbox "Master key stored (wrapped to this machine)." 10 60
+                    load_master_key_from_db
+                else
+                    whiptail --title "Error" --msgbox "Failed to store master key. Ensure openssl is available." 10 60
+                fi
+                ;;
+            "Clear")
+                if whiptail --title "Clear" --yesno "Are you sure you want to remove the stored master key?\nAny encrypted passwords will no longer be decryptable on this machine." 12 70; then
+                    store_master_key_to_db ""
+                    whiptail --title "Cleared" --msgbox "Stored master key removed." 10 60
+                    unset RBACKUP_MASTER_KEY
+                fi
+                ;;
+        esac
     done
 }
 
@@ -741,6 +907,27 @@ run_backup() {
 
     CLIENT=$(sqlite3 "$DB_FILE" "SELECT name, ip, username, password, ssh_key FROM clients WHERE id = $CLIENT_ID;")
     IFS="|" read -r NAME IP USERNAME PASSWORD SSH_KEY <<< "$CLIENT"
+
+    if [[ "$PASSWORD" == ENC:* ]]; then
+        ENC_ONLY="${PASSWORD#ENC:}"
+        if [ -z "$RBACKUP_MASTER_KEY" ]; then
+            echo "Encrypted password found for client $NAME but RBACKUP_MASTER_KEY is not set. Aborting."
+            exit 1
+        fi
+        DECRYPTED=$(decrypt_password "$ENC_ONLY")
+        if [ -z "$DECRYPTED" ]; then
+            echo "Failed to decrypt password for client $NAME. Check RBACKUP_MASTER_KEY." >&2
+            exit 1
+        fi
+        PASSWORD="$DECRYPTED"
+    else
+        if [ -n "$PASSWORD" ] && [ -n "$RBACKUP_MASTER_KEY" ]; then
+            ENC_PASS=$(encrypt_password "$PASSWORD")
+            if [ -n "$ENC_PASS" ]; then
+                sqlite3 "$DB_FILE" "UPDATE clients SET password = 'ENC:$ENC_PASS' WHERE id = $CLIENT_ID;"
+            fi
+        fi
+    fi
 
     SETTINGS=$(sqlite3 "$DB_FILE" "SELECT backup_path notify_url FROM settings LIMIT 1;")
     IFS="|" read -r BACKUP_PATH NOTIFY_URL <<< "$SETTINGS"
