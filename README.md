@@ -13,7 +13,7 @@ Since I don't always have direct physical access, I wanted to enable remote back
 - Backups are performed via SSH and Rsync (also via an SSH tunnel). This means the target can/must remain powered on and the SD card does not need to be removed.
 - Backups from remote locations can be conveniently performed via VPN connections (which must be established beforehand and are not part of this). It only requires an SSH connection.
 
-## Hauptfeatures
+## Main Features
 
 - Full image creation: replicate partition table, create filesystems, and copy partition contents into a single image file (.img).
 - Incremental updates: mount the image locally and rsync changed files from the remote host into the mounted partitions.
