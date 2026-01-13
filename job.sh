@@ -1,23 +1,4 @@
 #!/bin/bash
-#
-# job.sh
-#
-# This script can be used in two ways:
-#
-# 1. Full backup: If no backup image exists yet, a complete image of the remote
-#    device (e.g., /dev/mmcblk0) will be created, including the partition table,
-#    formatting, and data copied via rsync (excluding virtual file systems).
-#
-# 2. Incremental backup: If the OUTPUT_IMAGE already exists, the data in each
-#    partition (that has a mount point) will be incrementally updated from the
-#    remote system using rsync.
-#
-# Call:
-#   sudo ./job.sh REMOTE_HOST REMOTE_DEVICE OUTPUT_IMAGE WORK_DIRECTORY [EXCLUDES...]
-#
-# Example:
-#   sudo ./job.sh root@10.0.1.41 /dev/mmcblk0 example.img /tmp \
-#       --exclude=/proc/* --exclude=/sys/* --exclude=/dev/* --exclude=/run/*
 
 set -e
 
@@ -27,20 +8,79 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
-# Usage check: at least 4 parameters
-if [ "$#" -lt 4 ]; then
-  echo "Usage: $0 REMOTE_HOST REMOTE_DEVICE OUTPUT_IMAGE WORK_DIRECTORY [EXCLUDES...]"
+# Show help
+show_help() {
+    cat << EOF
+${GREEN}Raspi-Backup Job Script${NC}
+
+${GREEN}DESCRIPTION${NC}
+  This script performs full or incremental backups of remote Linux devices via SSH/Rsync.
+  - Full backup: Creates a complete disk image including partition table, formatting, and data
+  - Incremental backup: Updates existing image with new/changed data from remote device
+
+${GREEN}USAGE${NC}
+  sudo $0 REMOTE_HOST REMOTE_DEVICE OUTPUT_IMAGE WORK_DIRECTORY [PASSWORD] [EXCLUDES...]
+
+${GREEN}REQUIRED PARAMETERS${NC}
+  REMOTE_HOST         SSH connection string (e.g., root@10.0.1.41)
+  REMOTE_DEVICE       Device path on remote system (e.g., /dev/mmcblk0)
+  OUTPUT_IMAGE        Output image file path (e.g., ./backup.img)
+  WORK_DIRECTORY      Working directory for temporary files (e.g., /tmp)
+
+${GREEN}OPTIONAL PARAMETERS${NC}
+  PASSWORD            SSH password (leave empty for key-based auth)
+  EXCLUDES            Rsync exclude patterns (e.g., --exclude=/proc/* --exclude=/sys/*)
+
+${GREEN}EXAMPLES${NC}
+  Full backup with SSH key authentication:
+    sudo $0 root@10.0.1.41 /dev/mmcblk0 ./backup.img /tmp
+
+  Full backup with password:
+    sudo $0 root@10.0.1.41 /dev/mmcblk0 ./backup.img /tmp "mypassword"
+
+  Incremental backup with custom excludes:
+    sudo $0 root@10.0.1.41 /dev/mmcblk0 ./backup.img /tmp "" \
+        --exclude=/proc/* --exclude=/sys/* --exclude=/tmp/*
+
+${GREEN}SUPPORTED FILESYSTEMS${NC}
+  - FAT32 (vfat)
+  - ext4, ext3, ext2
+  - Swap
+
+${GREEN}REQUIREMENTS${NC}
+  - Must run as root (sudo)
+  - SSH access to remote host
+  - Required tools: blockdev, sfdisk, lsblk, blkid, losetup, dd, mkfs.*, mount, rsync
+  - For best results: partprobe (parted package)
+
+${GREEN}OPTIONS${NC}
+  -h, --help          Show this help message
+
+EOF
+    exit 0
+}
+
+# Check for help flag and at least 4 parameters
+if [[ "$1" == "-h" || "$1" == "--help" || "$#" -lt 4 ]]; then
+    show_help
+fi
+
+set -e
+
+# Ensure running as root
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root."
   exit 1
 fi
 
-REMOTE_HOST="$1"      # e.g. root@10.0.1.41
-REMOTE_DEV="$2"       # e.g. /dev/mmcblk0
-OUTPUT_IMAGE="$3"     # e.g. example.img
-WORK_DIRECTORY="$4"   # e.g. /tmp
+REMOTE_HOST="$1"
+REMOTE_DEV="$2"
+OUTPUT_IMAGE="$3"
+WORK_DIRECTORY="$4"
 shift 4
 PASSWORD="$1"
 shift 1
-EXCLUDES=("$@")       # any additional rsync exclude options
+EXCLUDES=("$@")
 
 if [ -n "$PASSWORD" ]; then
   SSH_CMD="sshpass -p '$PASSWORD' ssh -o StrictHostKeyChecking=no"
@@ -118,15 +158,85 @@ get_fs_info() {
   echo "$label" "$uuid"
 }
 
-check_tools() {
-    commands=("blockdev" "sfdisk" "lsblk" "blkid" "losetup" "partprobe" "fallocate" "dd" "mkfs.vfat" "mkfs.ext4" "mkfs.ext3" "mkfs.ext2" "mkswap" "mount" "rsync")
+check_and_install_tools() {
+    # Define packages and their corresponding commands for job.sh
+    # Format: "command:package"
+    local -A packages=(
+        ["blockdev"]="util-linux"
+        ["sfdisk"]="util-linux"
+        ["lsblk"]="util-linux"
+        ["blkid"]="util-linux"
+        ["losetup"]="util-linux"
+        ["partprobe"]="parted"
+        ["fallocate"]="util-linux"
+        ["dd"]="coreutils"
+        ["mkfs.vfat"]="dosfstools"
+        ["mkfs.ext4"]="e2fsprogs"
+        ["mkfs.ext3"]="e2fsprogs"
+        ["mkfs.ext2"]="e2fsprogs"
+        ["mkswap"]="util-linux"
+        ["mount"]="util-linux"
+        ["rsync"]="rsync"
+        ["ssh"]="openssh-client"
+        ["sshpass"]="sshpass"
+    )
 
-    for tool in "${commands[@]}"; do
-        if ! command -v "$commands" &> /dev/null; then
-            log_error "Error: $commands is not installed. Please install it using your package manager."
-            exit 1
+    local missing_tools=()
+    local missing_packages=()
+
+    log_step "0.1" "Checking required tools"
+
+    # Check which tools are missing
+    for tool in "${!packages[@]}"; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_tools+=("$tool")
+            if [[ ! " ${missing_packages[@]} " =~ " ${packages[$tool]} " ]]; then
+                missing_packages+=("${packages[$tool]}")
+            fi
         fi
     done
+
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        log_warning "The following tools are missing: ${missing_tools[*]}"
+        log_step "0.2" "Installing missing packages: ${missing_packages[*]}"
+
+        # Detect package manager
+        if command -v apt-get &> /dev/null; then
+            log_step "0.3" "Using apt-get..."
+            sudo apt-get update
+            sudo apt-get install -y "${missing_packages[@]}"
+        elif command -v yum &> /dev/null; then
+            log_step "0.3" "Using yum..."
+            sudo yum install -y "${missing_packages[@]}"
+        elif command -v pacman &> /dev/null; then
+            log_step "0.3" "Using pacman..."
+            sudo pacman -S --noconfirm "${missing_packages[@]}"
+        elif command -v apk &> /dev/null; then
+            log_step "0.3" "Using apk..."
+            sudo apk add "${missing_packages[@]}"
+        else
+            log_error "Could not detect package manager. Please install the following packages manually:"
+            echo "${missing_packages[@]}"
+            exit 1
+        fi
+
+        # Verify installation
+        local still_missing=()
+        for tool in "${missing_tools[@]}"; do
+            if ! command -v "$tool" &> /dev/null; then
+                still_missing+=("$tool")
+            fi
+        done
+
+        if [ ${#still_missing[@]} -gt 0 ]; then
+            log_error "Installation failed. The following tools are still missing: ${still_missing[*]}"
+            exit 1
+        else
+            log_done
+        fi
+    else
+        log_done
+    fi
 }
 
 mount_partition() {
@@ -148,8 +258,7 @@ mount_partition() {
 }
 
 log_step 1 "Checking required tools"
-check_tools
-log_done
+check_and_install_tools
 
 if [ ! -f "$OUTPUT_IMAGE" ]; then
   ##########################
@@ -229,7 +338,7 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
     echo "Processing remote partition /dev/$PART_NAME: fstype=$FSTYPE, mountpoint='$MOUNTPOINT'"
 
     read ORG_LABEL ORG_UUID < <(get_fs_info "$PART_NAME")
-    echo "  Original Label: ${ORG_LABEL:-(keins)}, UUID: ${ORG_UUID:-(keins)}"
+    echo "  Original Label: ${ORG_LABEL:-(none)}, UUID: ${ORG_UUID:-(none)}"
 
     if [ -n "$MOUNTPOINT" ]; then
       SRC_SIZE=$(ssh "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')

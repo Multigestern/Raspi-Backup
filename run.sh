@@ -6,9 +6,9 @@ RED='\033[0;31m'
 ORANGE='\033[0;33m'
 NC='\033[0m'
 
-DB_FILE="backup_clients.db"
 FULLPATH="$(realpath "$0")"
 SCRIPT_DIR="$(dirname "$FULLPATH")"
+DB_FILE="$SCRIPT_DIR/backup_clients.db"
 
 # Encryption helpers
 encrypt_password() {
@@ -27,7 +27,12 @@ decrypt_password() {
         echo ""
         return 0
     fi
-    printf '%s' "$1" | openssl enc -d -aes-256-cbc -a -pbkdf2 -pass env:RBACKUP_MASTER_KEY 2>/dev/null
+    echo -n "$1" | openssl enc -d -aes-256-cbc -a -A -pbkdf2 -pass env:RBACKUP_MASTER_KEY 2>/dev/null
+}
+
+# Generate a random master key
+generate_random_master_key() {
+    openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
 }
 
 # Wrapping key helpers: derive a machine-specific wrap key to protect the stored master key
@@ -44,7 +49,13 @@ get_machine_uuid() {
 derive_wrap_key() {
     local uuid
     uuid=$(get_machine_uuid)
-    printf '%s' "$uuid" | sha256sum 2>/dev/null | awk '{print $1}' || printf '%s' "$uuid" | shasum -a 256 | awk '{print $1}'
+    local wrap_key
+    if command -v sha256sum >/dev/null 2>&1; then
+        wrap_key=$(printf '%s' "$uuid" | sha256sum | awk '{print $1}')
+    else
+        wrap_key=$(printf '%s' "$uuid" | shasum -a 256 | awk '{print $1}')
+    fi
+    printf '%s' "$wrap_key"
 }
 
 wrap_master_key() {
@@ -54,7 +65,7 @@ wrap_master_key() {
     fi
     local wrap
     wrap=$(derive_wrap_key)
-    printf '%s' "$1" | openssl enc -aes-256-cbc -a -salt -pbkdf2 -pass pass:"$wrap" -A 2>/dev/null
+    echo -n "$1" | openssl enc -aes-256-cbc -a -salt -pbkdf2 -pass pass:"$wrap" -A 2>/dev/null
 }
 
 unwrap_master_key() {
@@ -64,7 +75,7 @@ unwrap_master_key() {
     fi
     local wrap
     wrap=$(derive_wrap_key)
-    printf '%s' "$1" | openssl enc -d -aes-256-cbc -a -pbkdf2 -pass pass:"$wrap" 2>/dev/null
+    echo -n "$1" | openssl enc -d -aes-256-cbc -a -A -pbkdf2 -pass pass:"$wrap" 2>/dev/null
 }
 
 load_master_key_from_db() {
@@ -74,34 +85,50 @@ load_master_key_from_db() {
     if [ ! -f "$DB_FILE" ]; then
         return 0
     fi
-    ENC_KEY=$(sqlite3 "$DB_FILE" "SELECT master_key_encrypted FROM settings LIMIT 1;" 2>/dev/null || echo "")
+    
+    ENC_KEY=$(sqlite3 "$DB_FILE" "SELECT master_key_encrypted FROM settings LIMIT 1;" 2>/dev/null)
+    
     if [ -n "$ENC_KEY" ]; then
-        if [ "$ENC_KEY" != "" ]; then
-            DECRYPTED=$(unwrap_master_key "$ENC_KEY")
-            if [ -n "$DECRYPTED" ]; then
-                export RBACKUP_MASTER_KEY="$DECRYPTED"
-            fi
+        DECRYPTED=$(unwrap_master_key "$ENC_KEY")
+        if [ -n "$DECRYPTED" ]; then
+            export RBACKUP_MASTER_KEY="$DECRYPTED"
+            return 0
+        else
+            return 1
         fi
+    else
+        generate_and_store_master_key
+        return $?
     fi
 }
 
-store_master_key_to_db() {
-    local plaintext="$1"
-    if [ -z "$plaintext" ]; then
-        sqlite3 "$DB_FILE" "UPDATE settings SET master_key_encrypted = '' WHERE id = 1;"
-        return 0
+generate_and_store_master_key() {
+    RANDOM_KEY=$(generate_random_master_key)
+    if [ -z "$RANDOM_KEY" ]; then
+        return 1
     fi
-    local wrapped
-    wrapped=$(wrap_master_key "$plaintext")
-    if [ -n "$wrapped" ]; then
-        sqlite3 "$DB_FILE" "UPDATE settings SET master_key_encrypted = '$wrapped' WHERE id = 1;"
+    if store_master_key_to_db "$RANDOM_KEY"; then
+        export RBACKUP_MASTER_KEY="$RANDOM_KEY"
         return 0
     else
         return 1
     fi
 }
 
-
+store_master_key_to_db() {
+    local plaintext="$1"
+    if [ -z "$plaintext" ]; then
+        sqlite3 "$DB_FILE" "UPDATE settings SET master_key_encrypted = '' WHERE id = 1;" 2>/dev/null
+        return 0
+    fi
+    local wrapped
+    wrapped=$(wrap_master_key "$plaintext")
+    if [ -z "$wrapped" ]; then
+        return 1
+    fi
+    sqlite3 "$DB_FILE" "UPDATE settings SET master_key_encrypted = '$wrapped' WHERE id = 1;" 2>/dev/null
+    return 0
+}
 
 # Initialize the SQLite database
 initialize_db() {
@@ -135,9 +162,7 @@ CREATE TABLE IF NOT EXISTS settings (
     notify_url TEXT NOT NULL,
     master_key_encrypted TEXT
 );
-INSERT OR IGNORE INTO settings (id, backup_path) VALUES (1, '/tmp');
-INSERT OR IGNORE INTO settings (id, notify_url) VALUES (1, 'https://example.com');
-INSERT OR IGNORE INTO settings (id, master_key_encrypted) VALUES (1, '');
+INSERT OR IGNORE INTO settings (id, backup_path, notify_url, master_key_encrypted) VALUES (1, '/tmp', 'https://example.com', '');
 EOF
 
     sqlite3 "$DB_FILE" <<EOF
@@ -160,8 +185,6 @@ CREATE TABLE IF NOT EXISTS job_excludes (
 );
 EOF
 }
-
-load_master_key_from_db
 
 # Display the main menu
 main_menu() {
@@ -317,8 +340,6 @@ VALUES ("$NAME", "$NEW_IP", "$USERNAME", "$STORED_PASSWORD", $USE_SSH_KEY);
 EOF
 
     whiptail --title "Add Client" --msgbox "Client added successfully." 10 60
-
-    list_clients
 }
 
 edit_client() {
@@ -392,8 +413,6 @@ WHERE id = $CLIENT_ID;
 EOF
 
     whiptail --title "Edit Client" --msgbox "Client updated successfully." 10 60
-
-    list_clients
 }
 
 delete_client() {
@@ -530,8 +549,6 @@ EOF
     update_cron
 
     whiptail --title "Add Backup Job" --msgbox "Backup job added successfully!" 10 60
-
-    backup_jobs
 }
 
 edit_job() {
@@ -582,8 +599,6 @@ EOF
     update_cron
 
     whiptail --title "Edit Job" --msgbox "Backup job updated successfully!" 10 60
-
-    backup_jobs
 }
 
 delete_job() {
@@ -670,8 +685,7 @@ settings_menu() {
         CHOICE=$(whiptail --title "Settings" --menu "Choose an option" --cancel-button "Back" 25 100 16 \
             "Backup Path" "Set the Path, where Backups should be stored." \
             "Notification URL" "Set the URL which should recieve a POST if a Backups has errors." \
-            "Global Exclusions" "Manage Exclusions for the Rsync Backup." \
-            "Master Key" "Set or clear the master key used to encrypt SSH passwords." 3>&1 1>&2 2>&3)
+            "Global Exclusions" "Manage Exclusions for the Rsync Backup." 3>&1 1>&2 2>&3)
 
         [ $? -ne 0 ] && return
 
@@ -685,16 +699,12 @@ settings_menu() {
             "Global Exclusions")
                 manage_global_excludes
                 ;;
-                "Master Key")
-                    master_key_menu
-                    ;;
         esac
     done
 }
 
 backup_path() {
     BACKUP_PATH=$(sqlite3 "$DB_FILE" "SELECT backup_path FROM settings LIMIT 1;")
-    echo "$BACKUP_PATH"
     if [ -z "$BACKUP_PATH" ]; then
         sqlite3 "$DB_FILE" "INSERT INTO settings (backup_path) VALUES ('/tmp');"
         BACKUP_PATH="/tmp"
@@ -769,48 +779,6 @@ manage_global_excludes() {
     done
 }
 
-master_key_menu() {
-    while true; do
-        CUR_VAL=$(sqlite3 "$DB_FILE" "SELECT master_key_encrypted FROM settings LIMIT 1;" 2>/dev/null || echo "")
-        if [ -z "$CUR_VAL" ]; then
-            DISPLAY="(not set)"
-        else
-            DISPLAY="(stored)"
-        fi
-
-        CHOICE=$(whiptail --title "Master Key" --menu "Master Key is $DISPLAY. Choose an action:" --cancel-button "Back" 15 80 6 \
-            "Set" "Set or update master key (will be stored encrypted)." \
-            "Clear" "Remove stored master key from DB." 3>&1 1>&2 2>&3)
-
-        [ $? -ne 0 ] && return
-
-        case $CHOICE in
-            "Set")
-                MK=$(whiptail --title "Set Master Key" --passwordbox "Enter master key to encrypt SSH passwords (this will be stored encrypted on this machine):" 12 70 3>&1 1>&2 2>&3)
-                [ $? -ne 0 ] && continue
-                CONF=$(whiptail --title "Confirm" --passwordbox "Re-enter master key:" 12 70 3>&1 1>&2 2>&3)
-                [ $? -ne 0 ] && continue
-                if [ "$MK" != "$CONF" ]; then
-                    whiptail --title "Mismatch" --msgbox "Master keys do not match." 10 60
-                    continue
-                fi
-                if store_master_key_to_db "$MK"; then
-                    whiptail --title "Saved" --msgbox "Master key stored (wrapped to this machine)." 10 60
-                    load_master_key_from_db
-                else
-                    whiptail --title "Error" --msgbox "Failed to store master key. Ensure openssl is available." 10 60
-                fi
-                ;;
-            "Clear")
-                if whiptail --title "Clear" --yesno "Are you sure you want to remove the stored master key?\nAny encrypted passwords will no longer be decryptable on this machine." 12 70; then
-                    store_master_key_to_db ""
-                    whiptail --title "Cleared" --msgbox "Stored master key removed." 10 60
-                    unset RBACKUP_MASTER_KEY
-                fi
-                ;;
-        esac
-    done
-}
 
 add_global_exclude() {
     EXCLUDE_PATH=$(whiptail --title "Add Global Exclude" --inputbox "Enter the path to exclude:" 10 60 3>&1 1>&2 2>&3)
@@ -994,7 +962,7 @@ cleanup_old_backups() {
             | head -n "$DELETE_COUNT" \
             | cut -d' ' -f2- \
             | while read -r file; do
-                echo "Lösche: $file"
+                echo "Deleting: $file"
                 rm -f "$file"
               done
     else
@@ -1002,27 +970,109 @@ cleanup_old_backups() {
     fi
 }
 
-check_tools() {
-    commands=("jq" "pigz" "sqlite3" "whiptail" "tar" "ssh" "rsync" "grep" "curl" "sshpass")
+check_and_install_tools() {
+    # Define packages and their corresponding commands
+    # Format: "command:package1,package2|command2:package"
+    local -A packages=(
+        ["jq"]="jq"
+        ["pigz"]="pigz"
+        ["sqlite3"]="sqlite3"
+        ["whiptail"]="whiptail"
+        ["tar"]="tar"
+        ["ssh"]="openssh-client"
+        ["rsync"]="rsync"
+        ["curl"]="curl"
+        ["sshpass"]="sshpass"
+        ["blkid"]="util-linux"
+        ["losetup"]="util-linux"
+        ["partprobe"]="parted"
+        ["mkfs.vfat"]="dosfstools"
+        ["mkfs.ext4"]="e2fsprogs"
+        ["mkfs.ext3"]="e2fsprogs"
+        ["mkfs.ext2"]="e2fsprogs"
+        ["mkswap"]="util-linux"
+        ["blockdev"]="util-linux"
+        ["sfdisk"]="util-linux"
+        ["lsblk"]="util-linux"
+        ["fallocate"]="util-linux"
+        ["dd"]="coreutils"
+        ["mount"]="util-linux"
+    )
 
-    for tool in "${commands[@]}"; do
-        if ! command -v "$commands" &> /dev/null; then
-            echo -e "${RED}Error:${NC} $commands is not installed. Please install it using your package manager."
-            exit 1
+    local missing_tools=()
+    local missing_packages=()
+
+    echo -e "${GREEN}[CHECK]${NC} Checking required tools..."
+
+    # Check which tools are missing
+    for tool in "${!packages[@]}"; do
+        if ! command -v "$tool" &> /dev/null; then
+            missing_tools+=("$tool")
+            if [[ ! " ${missing_packages[@]} " =~ " ${packages[$tool]} " ]]; then
+                missing_packages+=("${packages[$tool]}")
+            fi
         fi
     done
+
+    if [ ${#missing_tools[@]} -gt 0 ]; then
+        echo -e "${ORANGE}Warning:${NC} The following tools are missing: ${missing_tools[*]}"
+        echo -e "${ORANGE}Installing:${NC} ${missing_packages[*]}"
+
+        # Detect package manager
+        if command -v apt-get &> /dev/null; then
+            echo "Using apt-get..."
+            sudo apt-get update
+            sudo apt-get install -y "${missing_packages[@]}"
+        elif command -v yum &> /dev/null; then
+            echo "Using yum..."
+            sudo yum install -y "${missing_packages[@]}"
+        elif command -v pacman &> /dev/null; then
+            echo "Using pacman..."
+            sudo pacman -S --noconfirm "${missing_packages[@]}"
+        elif command -v apk &> /dev/null; then
+            echo "Using apk..."
+            sudo apk add "${missing_packages[@]}"
+        else
+            echo -e "${RED}Error:${NC} Could not detect package manager. Please install the following packages manually:"
+            echo "${missing_packages[@]}"
+            exit 1
+        fi
+
+        # Verify installation
+        local still_missing=()
+        for tool in "${missing_tools[@]}"; do
+            if ! command -v "$tool" &> /dev/null; then
+                still_missing+=("$tool")
+            fi
+        done
+
+        if [ ${#still_missing[@]} -gt 0 ]; then
+            echo -e "${RED}Error:${NC} Installation failed. The following tools are still missing: ${still_missing[*]}"
+            exit 1
+        else
+            echo -e "${GREEN}✔${NC} All required tools are now installed."
+        fi
+    else
+        echo -e "${GREEN}✔${NC} All required tools are installed."
+    fi
 }
 
-# Testen ob alle tools installiert sind
-check_tools
+# Check and install required tools
+check_and_install_tools
 
-# Überprüfen, ob das Skript mit `--auto` aufgerufen wurde
+# Initialize the database
+initialize_db
+
+# Load master key after database initialization
+if ! load_master_key_from_db; then
+    echo "Error: Failed to load master key from database. Check system UUID consistency."
+    exit 1
+fi
+
+# Check if script is called with `--auto`
 if [[ "$1" == "--auto" ]]; then
     run_backup $2
 fi
 
-# Initialisiere die Datenbank
-initialize_db
-
-# Zeige das Hauptmenü
+# Show main menu
 main_menu
