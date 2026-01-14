@@ -160,9 +160,10 @@ CREATE TABLE IF NOT EXISTS settings (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     backup_path TEXT NOT NULL,
     notify_url TEXT NOT NULL,
+    log_path TEXT DEFAULT '/tmp',
     master_key_encrypted TEXT
 );
-INSERT OR IGNORE INTO settings (id, backup_path, notify_url, master_key_encrypted) VALUES (1, '/tmp', 'https://example.com', '');
+INSERT OR IGNORE INTO settings (id, backup_path, notify_url, log_path, master_key_encrypted) VALUES (1, '/tmp', 'https://example.com', '/tmp', '');
 EOF
 
     sqlite3 "$DB_FILE" <<EOF
@@ -189,7 +190,7 @@ EOF
 # Display the main menu
 main_menu() {
     while true; do
-        CHOICE=$(whiptail --title "Main Menu" --menu "Choose an option" --cancel-button "Exit" 25 100 16 \
+        CHOICE=$(whiptail --title "Main Menu" --menu "Choose an option" --cancel-button "Exit" 25 120 16 \
             "List Clients" "List all registered backup clients." \
             "Backup Jobs" "Manage backup jobs for clients." \
             "Settings" "Configure backup settings." \
@@ -239,26 +240,33 @@ Log files are saved under /tmp with the job ID and contain any errors." 24 80
 
 # Liste existing clients
 list_clients() {
-    CLIENTS=$(sqlite3 "$DB_FILE" "SELECT id, name, ip FROM clients;")
+    CLIENTS=$(sqlite3 "$DB_FILE" <<EOF
+SELECT id, name, ip FROM clients;
+EOF
+)
 
     if [ -z "$CLIENTS" ]; then
         if whiptail --title "List Clients" --yesno "No clients found. Add a new client?" 10 60; then
             add_client
+            list_clients
         else
             return
         fi
     fi
 
     MENU_ENTRIES=()
-    while IFS="|" read -r ID NAME IP; do
-        MENU_ENTRIES+=("$ID" "$NAME ($IP)")
+    while IFS='|' read -r ID NAME IP; do
+        if [ -n "$ID" ] && [ -n "$NAME" ]; then
+            MENU_ENTRIES+=("$ID" "$NAME ($IP)")
+        fi
     done <<< "$CLIENTS"
 
-    SELECTED=$(whiptail --title "List Clients" --menu "Select a client to edit or delete:" --cancel-button "Back" 25 100 16 "${MENU_ENTRIES[@]}" "Add Client" "Create a new client" 3>&1 1>&2 2>&3)
+    SELECTED=$(whiptail --title "List Clients" --menu "Select a client to edit or delete:" --cancel-button "Back" 25 120 16 "${MENU_ENTRIES[@]}" "Add Client" "Create a new client" 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
     if [ "$SELECTED" == "Add Client" ]; then
         add_client
+        list_clients
         return
     fi
 
@@ -434,7 +442,10 @@ delete_client() {
 #########################################
 
 backup_jobs() {
-    CLIENTS=$(sqlite3 "$DB_FILE" "SELECT id, name, ip FROM clients;")
+    CLIENTS=$(sqlite3 "$DB_FILE" <<'SQL'
+SELECT id, name, ip FROM clients;
+SQL
+)
 
     if [ -z "$CLIENTS" ]; then
         whiptail --title "Backup Jobs" --msgbox "No clients found. Please add clients first." 10 60
@@ -442,15 +453,20 @@ backup_jobs() {
     fi
 
     MENU_ENTRIES=()
-    while IFS="|" read -r ID NAME IP; do
-        MENU_ENTRIES+=("$ID" "$NAME ($IP)")
+    while IFS='|' read -r ID NAME IP; do
+        if [ -n "$ID" ] && [ -n "$NAME" ]; then
+            MENU_ENTRIES+=("$ID" "$NAME ($IP)")
+        fi
     done <<< "$CLIENTS"
 
-    SELECTED_CLIENT=$(whiptail --title "Backup Jobs" --menu "Select a client to view and manage its backup jobs:" --cancel-button "Back" 25 100 16 "${MENU_ENTRIES[@]}" 3>&1 1>&2 2>&3)
+    SELECTED_CLIENT=$(whiptail --title "Backup Jobs" --menu "Select a client to view and manage its backup jobs:" --cancel-button "Back" 25 120 16 "${MENU_ENTRIES[@]}" 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
     CLIENT_NAME=$(sqlite3 "$DB_FILE" "SELECT name FROM clients WHERE id = $SELECTED_CLIENT;")
-    JOBS=$(sqlite3 "$DB_FILE" "SELECT id, schedule, max_backups, weekdays FROM backup_jobs WHERE client_id = $SELECTED_CLIENT;")
+    JOBS=$(sqlite3 "$DB_FILE" <<'SQL'
+SELECT id, schedule, max_backups, weekdays FROM backup_jobs WHERE client_id = $SELECTED_CLIENT;
+SQL
+)
 
     if [ -z "$JOBS" ]; then
         if whiptail --title "Manage Jobs" --yesno "No backup jobs found for client '$CLIENT_NAME'. Would you like to add one?" 10 60; then
@@ -460,11 +476,13 @@ backup_jobs() {
         fi
     else
         JOBS_MENU=()
-        while IFS="|" read -r JOB_ID JOB_SCHEDULE JOB_MAX_BACKUPS WEEKDAYS; do
-            JOBS_MENU+=("$JOB_ID" "Time: $JOB_SCHEDULE at $WEEKDAYS | Retention: $JOB_MAX_BACKUPS backup(s)")
+        while IFS='|' read -r JOB_ID JOB_SCHEDULE JOB_MAX_BACKUPS WEEKDAYS; do
+            if [ -n "$JOB_ID" ]; then
+                JOBS_MENU+=("$JOB_ID" "Time: $JOB_SCHEDULE at $WEEKDAYS | Retention: $JOB_MAX_BACKUPS backup(s)")
+            fi
         done <<< "$JOBS"
 
-        SELECTED_ACTION=$(whiptail --title "Manage Jobs" --menu "Manage backup jobs for client '$CLIENT_NAME':" --cancel-button "Back" 25 100 16 "${JOBS_MENU[@]}" "Add Job" "Create a new backup job for this client" 3>&1 1>&2 2>&3)
+        SELECTED_ACTION=$(whiptail --title "Manage Jobs" --menu "Manage backup jobs for client '$CLIENT_NAME':" --cancel-button "Back" 25 120 16 "${JOBS_MENU[@]}" "Add Job" "Create a new backup job for this client" 3>&1 1>&2 2>&3)
         [ $? -ne 0 ] && return
 
         if [ "$SELECTED_ACTION" == "Add Job" ]; then
@@ -682,8 +700,9 @@ manage_job_exclude_action() {
 
 settings_menu() {
     while true; do
-        CHOICE=$(whiptail --title "Settings" --menu "Choose an option" --cancel-button "Back" 25 100 16 \
+        CHOICE=$(whiptail --title "Settings" --menu "Choose an option" --cancel-button "Back" 25 120 16 \
             "Backup Path" "Set the Path, where Backups should be stored." \
+            "Log Path" "Set the Path, where Log files should be stored." \
             "Notification URL" "Set the URL which should recieve a POST if a Backups has errors." \
             "Global Exclusions" "Manage Exclusions for the Rsync Backup." 3>&1 1>&2 2>&3)
 
@@ -692,6 +711,9 @@ settings_menu() {
         case $CHOICE in
             "Backup Path")
                 backup_path
+                ;;
+            "Log Path")
+                log_path
                 ;;
             "Notification URL")
                 notification_url
@@ -731,6 +753,36 @@ EOF
     whiptail --title "Settings" --msgbox "Settings updated successfully." 10 60
 }
 
+log_path() {
+    LOG_PATH=$(sqlite3 "$DB_FILE" "SELECT log_path FROM settings LIMIT 1;")
+    if [ -z "$LOG_PATH" ]; then
+        sqlite3 "$DB_FILE" "INSERT INTO settings (log_path) VALUES ('/tmp');"
+        LOG_PATH="/tmp"
+    fi
+
+    while true; do
+        LOG_PATH=$(whiptail --title "Settings" --inputbox "Enter the log path:" 10 60 "$LOG_PATH" 3>&1 1>&2 2>&3)
+        [ $? -ne 0 ] && return
+
+        if [ -d "$LOG_PATH" ]; then
+            break
+        else
+            if whiptail --title "Invalid Path" --yesno "The specified path does not exist. \nShould \"$LOG_PATH\" be created?" 10 60; then
+                mkdir -p "$LOG_PATH"
+            fi
+        fi
+    done
+
+    sqlite3 "$DB_FILE" <<EOF
+UPDATE settings
+SET log_path = "$LOG_PATH";
+EOF
+
+    update_cron
+
+    whiptail --title "Settings" --msgbox "Settings updated successfully. Cron jobs have been updated." 10 60
+}
+
 notification_url() {
     NOTIFICATION_URL=$(sqlite3 "$DB_FILE" "SELECT notify_url FROM settings LIMIT 1;")
     if [ -z "$NOTIFICATION_URL" ]; then
@@ -764,7 +816,7 @@ manage_global_excludes() {
                 MENU_ENTRIES+=("$ID" "$EXCLUDE_PATH")
             done <<< "$EXCLUDES"
 
-            CHOICE=$(whiptail --title "Global Excludes" --menu "Manage global excludes:" --cancel-button "Back" 25 100 16 \
+            CHOICE=$(whiptail --title "Global Excludes" --menu "Manage global excludes:" --cancel-button "Back" 25 120 16 \
                 "${MENU_ENTRIES[@]}" \
                 "Add" "Add a new exclude path" 3>&1 1>&2 2>&3)
 
@@ -827,7 +879,15 @@ is_valid_ip() {
 }
 
 update_cron() {
-    JOBS=$(sqlite3 "$DB_FILE" "SELECT id, schedule, weekdays FROM backup_jobs;")
+    LOG_PATH=$(sqlite3 "$DB_FILE" "SELECT log_path FROM settings LIMIT 1;")
+    if [ -z "$LOG_PATH" ]; then
+        LOG_PATH="/tmp"
+    fi
+
+    JOBS=$(sqlite3 "$DB_FILE" <<'SQL'
+SELECT id, schedule, weekdays FROM backup_jobs;
+SQL
+)
     crontab -l | grep -v $FULLPATH | crontab -
 
     while IFS="|" read -r ID SCHEDULE WEEKDAYS; do
@@ -847,7 +907,7 @@ update_cron() {
                 -e 's/Sat/6/g')
         fi
 
-        (crontab -l; echo "$MINUTE $HOUR * * $WEEKDAYS cd $(pwd) && bash $FULLPATH --auto $ID >> /tmp/$ID.log") | crontab -
+        (crontab -l; echo "$MINUTE $HOUR * * $WEEKDAYS cd $(pwd) && bash $FULLPATH --auto $ID >> \"$LOG_PATH/$ID.log\"") | crontab -
     done <<< "$JOBS"
 }
 
@@ -870,6 +930,12 @@ generate_rsync_exclude_args() {
 
 run_backup() {
     JOB_ID="$1"
+    
+    if [ -z "$JOB_ID" ]; then
+        echo "Error: No JOB_ID provided. Usage: $0 --auto <JOB_ID>" >&2
+        exit 1
+    fi
+    
     JOB=$(sqlite3 "$DB_FILE" "SELECT id, client_id, disk, max_backups FROM backup_jobs WHERE id = $JOB_ID;")
     IFS="|" read -r ID CLIENT_ID DISK MAX_BACKUPS <<< "$JOB"
 
@@ -897,16 +963,25 @@ run_backup() {
         fi
     fi
 
-    SETTINGS=$(sqlite3 "$DB_FILE" "SELECT backup_path notify_url FROM settings LIMIT 1;")
-    IFS="|" read -r BACKUP_PATH NOTIFY_URL <<< "$SETTINGS"
+    SETTINGS=$(sqlite3 "$DB_FILE" "SELECT backup_path, notify_url, log_path FROM settings LIMIT 1;")
+    IFS="|" read -r BACKUP_PATH NOTIFY_URL LOG_PATH <<< "$SETTINGS"
 
-    LOGFILE=/tmp/"$JOB_ID".log
+    if [ -z "$LOG_PATH" ]; then
+        LOG_PATH="/tmp"
+        sqlite3 "$DB_FILE" "UPDATE settings SET log_path = '$LOG_PATH';"
+    fi
+
+    LOGFILE="$LOG_PATH"/"$JOB_ID".log
     current_date=$(date +%Y%m%d_%H%M%S)
-    echo "Starting Backup for $NAME at $current_date..."
-
+    
     if [ -f "$LOGFILE" ]; then
         rm "$LOGFILE"
     fi
+    
+    exec 1>>"$LOGFILE"
+    exec 2>>"$LOGFILE"
+    
+    echo "Starting Backup for $NAME at $current_date..."
 
     BACKUP_DIR="$BACKUP_PATH/$NAME"
     mkdir -p $BACKUP_DIR
@@ -933,11 +1008,7 @@ run_backup() {
     if [ -s "$LOGFILE" ]; then
         MESSAGE=$(<"$LOGFILE")
         JSON_PAYLOAD=$(jq -n --arg message "$MESSAGE" '{_message: $message}')
-        curl -X POST -H 'Content-Type: application/json' -d "$JSON_PAYLOAD" "$NOTIFY_URL"
-    fi
-
-    if [ -f "$LOGFILE" ]; then
-        rm "$LOGFILE"
+        curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d "$JSON_PAYLOAD" "$NOTIFY_URL" 2>/dev/null
     fi
 
     echo "Backup Done."

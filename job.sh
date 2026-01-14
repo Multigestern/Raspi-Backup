@@ -83,11 +83,17 @@ shift 1
 EXCLUDES=("$@")
 
 if [ -n "$PASSWORD" ]; then
-  SSH_CMD="sshpass -p '$PASSWORD' ssh -o StrictHostKeyChecking=no"
+  export SSHPASS="$PASSWORD"
+  SSH_CMD=("sshpass" "-e" "ssh" "-o" "StrictHostKeyChecking=no")
 else
-  SSH_CMD="ssh -o StrictHostKeyChecking=no"
+  SSH_CMD=("ssh" "-o" "StrictHostKeyChecking=no")
 fi
-export RSYNC_RSH="$SSH_CMD"
+
+RSYNC_RSH=""
+for cmd in "${SSH_CMD[@]}"; do
+  RSYNC_RSH="$RSYNC_RSH $cmd"
+done
+export RSYNC_RSH="${RSYNC_RSH# }"
 
 # Color definitions
 GREEN='\033[0;32m'
@@ -151,7 +157,7 @@ rsync_remote() {
 get_fs_info() {
   local part="$1"
   local ret
-  ret=$($SSH_CMD "$REMOTE_HOST" "sudo blkid -s LABEL -s UUID -o export /dev/$part" 2>/dev/null || echo "")
+  ret=$("${SSH_CMD[@]}" "$REMOTE_HOST" "sudo blkid -s LABEL -s UUID -o export /dev/$part" 2>/dev/null || echo "")
   local label uuid
   label=$(echo "$ret" | grep '^LABEL=' | cut -d '=' -f2)
   uuid=$(echo "$ret" | grep '^UUID=' | cut -d '=' -f2)
@@ -200,27 +206,31 @@ check_and_install_tools() {
         log_warning "The following tools are missing: ${missing_tools[*]}"
         log_step "0.2" "Installing missing packages: ${missing_packages[*]}"
 
+        export PATH="/sbin:/usr/sbin:/usr/local/sbin:$PATH"
+
         # Detect package manager
         if command -v apt-get &> /dev/null; then
             log_step "0.3" "Using apt-get..."
-            sudo apt-get update
-            sudo apt-get install -y "${missing_packages[@]}"
+            apt-get update
+            apt-get install -y "${missing_packages[@]}"
         elif command -v yum &> /dev/null; then
             log_step "0.3" "Using yum..."
-            sudo yum install -y "${missing_packages[@]}"
+            yum install -y "${missing_packages[@]}"
         elif command -v pacman &> /dev/null; then
             log_step "0.3" "Using pacman..."
-            sudo pacman -S --noconfirm "${missing_packages[@]}"
+            pacman -S --noconfirm "${missing_packages[@]}"
         elif command -v apk &> /dev/null; then
             log_step "0.3" "Using apk..."
-            sudo apk add "${missing_packages[@]}"
+            apk add "${missing_packages[@]}"
         else
             log_error "Could not detect package manager. Please install the following packages manually:"
             echo "${missing_packages[@]}"
             exit 1
         fi
 
-        # Verify installation
+        hash -r 2>/dev/null
+        export PATH="/sbin:/usr/sbin:/usr/local/sbin:$PATH"
+        
         local still_missing=()
         for tool in "${missing_tools[@]}"; do
             if ! command -v "$tool" &> /dev/null; then
@@ -267,7 +277,7 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
   log_step 2 "Creating full backup image for remote device $REMOTE_DEV on $REMOTE_HOST ..."
   echo "Target image: $OUTPUT_IMAGE"
 
-  IMAGE_SIZE=$(ssh "$REMOTE_HOST" "sudo blockdev --getsize64 $REMOTE_DEV")
+  IMAGE_SIZE=$("${SSH_CMD[@]}" "$REMOTE_HOST" "sudo blockdev --getsize64 $REMOTE_DEV")
   echo "Size of the remote device: $IMAGE_SIZE Bytes"
 
   log_step 3 "Create emptry image..."
@@ -280,7 +290,7 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
 
   log_step 4 "Exporting partition table from remote device..."
   TMP_PART_TABLE=$(mktemp $WORK_DIRECTORY/partition_table.XXXXXX)
-  ssh "$REMOTE_HOST" "sudo sfdisk -d $REMOTE_DEV" > "$TMP_PART_TABLE"
+  "${SSH_CMD[@]}" "$REMOTE_HOST" "sudo sfdisk -d $REMOTE_DEV" > "$TMP_PART_TABLE"
   log_done
 
   log_step 5 "Creating partitions and formatting them..."
@@ -305,7 +315,7 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
   echo "New loop device: $LOOPDEV"
 
   MAPFILE=$(mktemp $WORK_DIRECTORY/partition_map.XXXXXX)
-  ssh "$REMOTE_HOST" "lsblk -ln -o NAME,MOUNTPOINT,FSTYPE $REMOTE_DEV" | while read -r NAME MOUNT FSTYPE; do
+  "${SSH_CMD[@]}" "$REMOTE_HOST" "lsblk -ln -o NAME,MOUNTPOINT,FSTYPE $REMOTE_DEV" | while read -r NAME MOUNT FSTYPE; do
     if [ -n "$FSTYPE" ]; then
       echo "$NAME $MOUNT $FSTYPE" >> "$MAPFILE"
     fi
@@ -341,7 +351,7 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
     echo "  Original Label: ${ORG_LABEL:-(none)}, UUID: ${ORG_UUID:-(none)}"
 
     if [ -n "$MOUNTPOINT" ]; then
-      SRC_SIZE=$(ssh "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
+      SRC_SIZE=$("${SSH_CMD[@]}" "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
       DST_SIZE=$(blockdev --getsize64 "$LOOP_PART")
       if [ "$SRC_SIZE" -gt "$DST_SIZE" ]; then
         log_warning "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
@@ -452,7 +462,7 @@ else
   
 
   MAPFILE=$(mktemp $WORK_DIRECTORY/partition_map.XXXXXX)
-  ssh "$REMOTE_HOST" "lsblk -ln -o NAME,MOUNTPOINT,FSTYPE $REMOTE_DEV" | while read -r NAME MOUNT FSTYPE; do
+  "${SSH_CMD[@]}" "$REMOTE_HOST" "lsblk -ln -o NAME,MOUNTPOINT,FSTYPE $REMOTE_DEV" | while read -r NAME MOUNT FSTYPE; do
     if [ -n "$FSTYPE" ]; then
       echo "$NAME $MOUNT $FSTYPE" >> "$MAPFILE"
     fi
@@ -487,7 +497,7 @@ else
     echo "Updating remote partition /dev/$PART_NAME: fstype=$FSTYPE, mountpoint='$MOUNTPOINT'"
 
     if [ -n "$MOUNTPOINT" ]; then
-      SRC_SIZE=$(ssh "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
+      SRC_SIZE=$("${SSH_CMD[@]}" "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
       DST_SIZE=$(blockdev --getsize64 "$LOOP_PART")
       if [ "$SRC_SIZE" -gt "$DST_SIZE" ]; then
         log_warning "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
