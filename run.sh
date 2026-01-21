@@ -30,12 +30,10 @@ decrypt_password() {
     echo -n "$1" | openssl enc -d -aes-256-cbc -a -A -pbkdf2 -pass env:RBACKUP_MASTER_KEY 2>/dev/null
 }
 
-# Generate a random master key
 generate_random_master_key() {
     openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64
 }
 
-# Wrapping key helpers: derive a machine-specific wrap key to protect the stored master key
 get_machine_uuid() {
     if command -v ioreg >/dev/null 2>&1; then
         uuid=$(ioreg -rd1 -c IOPlatformExpertDevice | awk -F\" '/IOPlatformUUID/ {print $4; exit}')
@@ -226,12 +224,11 @@ To begin, register a client by providing a name and IP address. Connections are 
 You may either set a password (stored encrypted in the database) or leave the password blank and use SSH key authentication (has to be preconfigured).
 
 Important settings:
-- Backup Path: Location where backups are stored, organized by CLIENT_NAME/BACKUPFILE.
+- Backup Path: Location where backups are stored, organized by CLIENT_NAME/BACKUPFILE.+
+- Log Paht: Location where log files are saved. Default is /tmp.
 - Global Exclusions: Paths excluded from all Rsync backups.
 
-After registering a client, create a job for it.
-
-Log files are saved under /tmp with the job ID and contain any errors." 24 80
+After registering a client, create a job for it." 24 80
 }
 
 ##############################################
@@ -248,7 +245,7 @@ EOF
     if [ -z "$CLIENTS" ]; then
         if whiptail --title "List Clients" --yesno "No clients found. Add a new client?" 10 60; then
             add_client
-            list_clients
+            return
         else
             return
         fi
@@ -266,7 +263,6 @@ EOF
 
     if [ "$SELECTED" == "Add Client" ]; then
         add_client
-        list_clients
         return
     fi
 
@@ -287,7 +283,6 @@ EOF
     list_clients
 }
 
-# Add a new client
 add_client() {
     NAME=$(whiptail --title "Add Client" --inputbox "Enter client name:" 10 60 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
@@ -368,7 +363,6 @@ edit_client() {
             whiptail --title "Invalid IP" --msgbox "The entered IP address is not valid. Please enter a valid IPv4 address." 10 60
         fi
     done
-
 
     NEW_USERNAME=$(whiptail --title "Edit Client" --inputbox "Enter username:" 10 60 "$USERNAME" 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
@@ -1042,8 +1036,6 @@ cleanup_old_backups() {
 }
 
 check_and_install_tools() {
-    # Define packages and their corresponding commands
-    # Format: "command:package1,package2|command2:package"
     local -A packages=(
         ["jq"]="jq"
         ["pigz"]="pigz"
@@ -1075,7 +1067,6 @@ check_and_install_tools() {
 
     echo -e "${GREEN}[CHECK]${NC} Checking required tools..."
 
-    # Check which tools are missing
     for tool in "${!packages[@]}"; do
         if ! command -v "$tool" &> /dev/null; then
             missing_tools+=("$tool")
@@ -1089,7 +1080,6 @@ check_and_install_tools() {
         echo -e "${ORANGE}Warning:${NC} The following tools are missing: ${missing_tools[*]}"
         echo -e "${ORANGE}Installing:${NC} ${missing_packages[*]}"
 
-        # Detect package manager
         if command -v apt-get &> /dev/null; then
             echo "Using apt-get..."
             sudo apt-get update
@@ -1109,7 +1099,6 @@ check_and_install_tools() {
             exit 1
         fi
 
-        # Verify installation
         local still_missing=()
         for tool in "${missing_tools[@]}"; do
             if ! command -v "$tool" &> /dev/null; then

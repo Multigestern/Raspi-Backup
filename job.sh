@@ -123,14 +123,13 @@ log_warning() {
 
 rsync_remote() {
   local src="$1" dst="$2"
-  local rsync_opts=( -aAX --inplace --delete )
+  local rsync_opts=( -aAX --one-file-system --inplace --delete )
   if [ "${#EXCLUDES[@]}" -gt 0 ]; then
     rsync_opts+=( "${EXCLUDES[@]}" )
   else
     rsync_opts+=( --exclude="/proc/*" --exclude="/sys/*" --exclude="/dev/*" --exclude="/run/*" )
   fi
   
-  # Add these options for better handling of errors
   rsync_opts+=( 
     --ignore-errors 
     --partial
@@ -165,8 +164,6 @@ get_fs_info() {
 }
 
 check_and_install_tools() {
-    # Define packages and their corresponding commands for job.sh
-    # Format: "command:package"
     local -A packages=(
         ["blockdev"]="util-linux"
         ["sfdisk"]="util-linux"
@@ -192,7 +189,6 @@ check_and_install_tools() {
 
     log_step "0.1" "Checking required tools"
 
-    # Check which tools are missing
     for tool in "${!packages[@]}"; do
         if ! command -v "$tool" &> /dev/null; then
             missing_tools+=("$tool")
@@ -208,7 +204,6 @@ check_and_install_tools() {
 
         export PATH="/sbin:/usr/sbin:/usr/local/sbin:$PATH"
 
-        # Detect package manager
         if command -v apt-get &> /dev/null; then
             log_step "0.3" "Using apt-get..."
             apt-get update

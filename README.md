@@ -4,6 +4,9 @@ This is a simple Bash script that creates full and incremental backups of Raspbe
 
 Since I don't always have direct physical access, I wanted to enable remote backups, which then creates .img files. I wanted the .img file because, if an SD card breaks, I can simply take a new one, flash the image and put the SD card back in and the system is running again. I didn't want to deal with file permissions or anything like that.
 
+> [!IMPORTANT]
+> Only the defined devices are backed up. No other mounted disks and your device has to be mounted to be backed up.
+
 ## Core Ideas
 
 - Create a bootable image including partition table and data.
@@ -33,6 +36,9 @@ The scripts automatically check when they start whether everything they need is 
 - ssh (and if password-based SSH connections are desired `sshpass`)
 - standard GNU coreutils (dd, losetup, mktemp, etc.) and filesystem tools (mkfs.ext4, mkfs.vfat, etc.)
 - `whiptail` for the interactive TUI
+
+> [!NOTE]
+> A user with full rights for the device to be backed up is required.
 
 # Quick Start
 
