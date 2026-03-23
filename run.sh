@@ -884,7 +884,7 @@ update_cron() {
 SELECT id, schedule, weekdays FROM backup_jobs;
 SQL
 )
-    crontab -l | grep -v $FULLPATH | crontab -
+    crontab -l 2>/dev/null | grep -v "$FULLPATH" | crontab -
 
     while IFS="|" read -r ID SCHEDULE WEEKDAYS; do
         HOUR=$(echo "$SCHEDULE" | cut -d':' -f1)
@@ -903,7 +903,7 @@ SQL
                 -e 's/Sat/6/g')
         fi
 
-        (crontab -l; echo "$MINUTE $HOUR * * $WEEKDAYS cd $SCRIPT_DIR && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH bash $FULLPATH --auto $ID >> \"$LOG_PATH/$ID.log\"") | crontab -
+        (crontab -l; echo "$MINUTE $HOUR * * $WEEKDAYS cd $SCRIPT_DIR && bash $FULLPATH --auto $ID >> \"$LOG_PATH/$ID.log\"") | crontab -
     done <<< "$JOBS"
 }
 
