@@ -143,13 +143,13 @@ rsync_remote() {
   
   case $rsync_exit in
     0)  return 0 ;;
-    23|24) 
-      log_warning "Warning: Partial transfer (some files not copied, possibly due to space constraints)"
-      return 0 ;;
-    11) 
+    23|24)
+      log_error "Error: Partial transfer – some files were not copied (permission denied or other I/O error)"
+      return 1 ;;
+    11)
       log_warning "Warning: Some files were not copied due to space constraints"
       return 0 ;;
-    *)  
+    *)
       log_error "Error: rsync failed with exit code $rsync_exit"
       return 1 ;;
   esac
@@ -459,11 +459,18 @@ else
   
 
   MAPFILE=$(mktemp $WORK_DIRECTORY/partition_map.XXXXXX)
-  "${SSH_CMD[@]}" "$REMOTE_HOST" "lsblk -ln -o NAME,MOUNTPOINT,FSTYPE $REMOTE_DEV" | while read -r NAME MOUNT FSTYPE; do
+  "${SSH_CMD[@]}" "$REMOTE_HOST" "lsblk -ln -o NAME,MOUNTPOINT,FSTYPE $REMOTE_DEV" 2>&1 | while read -r NAME MOUNT FSTYPE; do
     if [ -n "$FSTYPE" ]; then
       echo "$NAME $MOUNT $FSTYPE" >> "$MAPFILE"
     fi
   done
+
+  if [ ! -s "$MAPFILE" ]; then
+    log_error "Could not retrieve partition map from remote host. Check SSH access and credentials."
+    rm -f "$MAPFILE"
+    losetup -d "$LOOPDEV" 2>/dev/null
+    exit 1
+  fi
 
   echo "Detected partitions on the remote device (Name, Mountpoint, Fstype):"
   cat "$MAPFILE"
@@ -472,6 +479,7 @@ else
   log_done
 
   log_step 4 "Updating partitions..."
+  BACKUP_ERRORS=0
   for LINE in "${PARTITIONS[@]}"; do
     read -r PART_NAME MOUNTPOINT FSTYPE <<< "$LINE"
 
@@ -516,7 +524,8 @@ else
         continue
       fi
       if ! rsync_remote "$REMOTE_HOST:$MOUNTPOINT"/ "$TMP_MNT"/; then
-        log_warning "Warning: Rsync reported warnings/errors but continuing with backup"
+        log_error "Rsync failed for partition $PART_NAME – backup may be incomplete"
+        BACKUP_ERRORS=$((BACKUP_ERRORS + 1))
       fi
       sync
       umount "$TMP_MNT" || log_warning "Warning: Failed to unmount $TMP_MNT"
@@ -532,6 +541,11 @@ else
   rm -f "$MAPFILE"
   losetup -d "$LOOPDEV"
   log_done
+
+  if [ "$BACKUP_ERRORS" -gt 0 ]; then
+    log_error "Backup finished with $BACKUP_ERRORS error(s). The image may be incomplete: $OUTPUT_IMAGE"
+    exit 1
+  fi
 
   echo "Done! The incremental backup has been updated: $OUTPUT_IMAGE"
 fi
