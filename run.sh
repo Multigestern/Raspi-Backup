@@ -10,6 +10,8 @@ FULLPATH="$(realpath "$0")"
 SCRIPT_DIR="$(dirname "$FULLPATH")"
 DB_FILE="$SCRIPT_DIR/backup_clients.db"
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 # Encryption helpers
 encrypt_password() {
     if [ -z "$1" ]; then
@@ -901,7 +903,7 @@ SQL
                 -e 's/Sat/6/g')
         fi
 
-        (crontab -l; echo "$MINUTE $HOUR * * $WEEKDAYS cd $(pwd) && bash $FULLPATH --auto $ID >> \"$LOG_PATH/$ID.log\"") | crontab -
+        (crontab -l; echo "$MINUTE $HOUR * * $WEEKDAYS cd $SCRIPT_DIR && PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:\$PATH bash $FULLPATH --auto $ID >> \"$LOG_PATH/$ID.log\"") | crontab -
     done <<< "$JOBS"
 }
 

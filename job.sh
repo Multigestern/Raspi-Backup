@@ -2,6 +2,8 @@
 
 set -e
 
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 # Ensure running as root
 if [ "$EUID" -ne 0 ]; then
   echo "Please run as root."
