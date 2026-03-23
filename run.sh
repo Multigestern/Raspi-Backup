@@ -459,10 +459,7 @@ SQL
     [ $? -ne 0 ] && return
 
     CLIENT_NAME=$(sqlite3 "$DB_FILE" "SELECT name FROM clients WHERE id = $SELECTED_CLIENT;")
-    JOBS=$(sqlite3 "$DB_FILE" <<'SQL'
-SELECT id, schedule, max_backups, weekdays FROM backup_jobs WHERE client_id = $SELECTED_CLIENT;
-SQL
-)
+    JOBS=$(sqlite3 "$DB_FILE" "SELECT id, schedule, max_backups, weekdays FROM backup_jobs WHERE client_id = $SELECTED_CLIENT;")
 
     if [ -z "$JOBS" ]; then
         if whiptail --title "Manage Jobs" --yesno "No backup jobs found for client '$CLIENT_NAME'. Would you like to add one?" 10 60; then
