@@ -161,10 +161,15 @@ CREATE TABLE IF NOT EXISTS settings (
     backup_path TEXT NOT NULL,
     notify_url TEXT NOT NULL,
     log_path TEXT DEFAULT '/tmp',
-    master_key_encrypted TEXT
+    master_key_encrypted TEXT,
+    notify_mode TEXT DEFAULT 'all'
 );
-INSERT OR IGNORE INTO settings (id, backup_path, notify_url, log_path, master_key_encrypted) VALUES (1, '/tmp', 'https://example.com', '/tmp', '');
+INSERT OR IGNORE INTO settings (id, backup_path, notify_url, log_path, master_key_encrypted, notify_mode) VALUES (1, '/tmp', 'https://example.com', '/tmp', '', 'all');
 EOF
+
+    # Migrations
+    sqlite3 "$DB_FILE" "ALTER TABLE settings ADD COLUMN notify_mode TEXT DEFAULT 'all';" 2>/dev/null
+    sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = 'all' WHERE notify_mode IS NULL OR notify_mode = '';" 2>/dev/null
 
     sqlite3 "$DB_FILE" <<EOF
 CREATE TABLE IF NOT EXISTS global_excludes (
@@ -228,9 +233,15 @@ You may either set a password (stored encrypted in the database) or leave the pa
 Important settings:
 - Backup Path: Location where backups are stored, organized by CLIENT_NAME/BACKUPFILE.+
 - Log Paht: Location where log files are saved. Default is /tmp.
+- Notification URL: Endpoint that can receive backup log notifications as JSON.
+- Notification Mode: Send all logs or only logs from failed backup runs.
 - Global Exclusions: Paths excluded from all Rsync backups.
 
-After registering a client, create a job for it." 24 80
+CLI options:
+- --auto <JOB_ID>: Run a backup job without opening the menu.
+- --test-notify <JOB_ID> [ok|error]: Send a test notification for a job using current settings.
+
+After registering a client, create a job for it." 28 90
 }
 
 ##############################################
@@ -696,7 +707,8 @@ settings_menu() {
         CHOICE=$(whiptail --title "Settings" --menu "Choose an option" --cancel-button "Back" 25 120 16 \
             "Backup Path" "Set the Path, where Backups should be stored." \
             "Log Path" "Set the Path, where Log files should be stored." \
-            "Notification URL" "Set the URL which should recieve a POST if a Backups has errors." \
+            "Notification URL" "Set the URL that should receive backup notifications." \
+            "Notification Mode" "Choose whether to send all logs or only logs with errors." \
             "Global Exclusions" "Manage Exclusions for the Rsync Backup." 3>&1 1>&2 2>&3)
 
         [ $? -ne 0 ] && return
@@ -710,6 +722,9 @@ settings_menu() {
                 ;;
             "Notification URL")
                 notification_url
+                ;;
+            "Notification Mode")
+                notification_mode
                 ;;
             "Global Exclusions")
                 manage_global_excludes
@@ -793,6 +808,38 @@ EOF
 
     whiptail --title "Settings" --msgbox "Settings updated successfully." 10 60
 }
+
+notification_mode() {
+    CURRENT_MODE=$(sqlite3 "$DB_FILE" "SELECT notify_mode FROM settings LIMIT 1;")
+
+    if [ -z "$CURRENT_MODE" ]; then
+        CURRENT_MODE="all"
+        sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = '$CURRENT_MODE';"
+    fi
+
+    if [ "$CURRENT_MODE" = "errors" ]; then
+        DEFAULT_ITEM="Only Errors"
+    else
+        DEFAULT_ITEM="All Logs"
+    fi
+
+    CHOICE=$(whiptail --title "Notification Mode" --menu "Choose when notifications should be sent:" --default-item "$DEFAULT_ITEM" --cancel-button "Back" 15 80 4 \
+        "All Logs" "Send notifications after every backup run." \
+        "Only Errors" "Send notifications only if the backup run had errors." 3>&1 1>&2 2>&3)
+    [ $? -ne 0 ] && return
+
+    case "$CHOICE" in
+        "All Logs")
+            sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = 'all';"
+            ;;
+        "Only Errors")
+            sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = 'errors';"
+            ;;
+    esac
+
+    whiptail --title "Notification Mode" --msgbox "Notification mode updated successfully." 10 60
+}
+
 manage_global_excludes() {
 
     while true; do
@@ -921,6 +968,97 @@ generate_rsync_exclude_args() {
     echo "${EXCLUDE_ARGS[@]}"
 }
 
+strip_ansi_codes() {
+    # Remove common ANSI escape sequences before sending notifications.
+    printf '%s' "$1" | sed -E $'s/\x1B\[[0-9;]*[[:alpha:]]//g'
+}
+
+send_notification() {
+    local notify_url="$1"
+    local raw_message="$2"
+
+    if [ -z "$notify_url" ] || [ -z "$raw_message" ]; then
+        return 1
+    fi
+
+    local message
+    message=$(strip_ansi_codes "$raw_message")
+    local json_payload
+    json_payload=$(jq -n --arg message "$message" '{_message: $message}')
+
+    curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d "$json_payload" "$notify_url" 2>/dev/null
+}
+
+test_notify() {
+    local job_id="$1"
+    local simulated_state="$2"
+
+    if [ -z "$job_id" ]; then
+        echo "Usage: $0 --test-notify <JOB_ID> [ok|error]"
+        return 1
+    fi
+
+    if [ -z "$simulated_state" ]; then
+        simulated_state="ok"
+    fi
+
+    if [ "$simulated_state" != "ok" ] && [ "$simulated_state" != "error" ]; then
+        echo "Invalid test state '$simulated_state'. Use 'ok' or 'error'."
+        return 1
+    fi
+
+    local settings
+    settings=$(sqlite3 "$DB_FILE" "SELECT notify_url, log_path, notify_mode FROM settings LIMIT 1;")
+    local notify_url log_path notify_mode
+    IFS="|" read -r notify_url log_path notify_mode <<< "$settings"
+
+    if [ -z "$log_path" ]; then
+        log_path="/tmp"
+    fi
+
+    if [ "$notify_mode" != "all" ] && [ "$notify_mode" != "errors" ]; then
+        notify_mode="all"
+    fi
+
+    local error_occurred=0
+    if [ "$simulated_state" = "error" ]; then
+        error_occurred=1
+    fi
+
+    local should_notify=0
+    if [ "$notify_mode" = "all" ]; then
+        should_notify=1
+    elif [ "$notify_mode" = "errors" ] && [ "$error_occurred" -eq 1 ]; then
+        should_notify=1
+    fi
+
+    if [ "$should_notify" -ne 1 ]; then
+        echo "Notification test skipped: notify_mode is '$notify_mode' and state is '$simulated_state'."
+        return 0
+    fi
+
+    local logfile="$log_path/$job_id.log"
+    local body
+    if [ -s "$logfile" ]; then
+        body=$(<"$logfile")
+    else
+        body="No log file found for job $job_id at $logfile. This is a generated test notification ($simulated_state)."
+    fi
+
+    local test_header="[TEST NOTIFICATION] job_id=$job_id state=$simulated_state mode=$notify_mode"
+    local payload="$test_header
+
+$body"
+
+    if send_notification "$notify_url" "$payload"; then
+        echo "Test notification sent successfully to $notify_url"
+        return 0
+    else
+        echo "Failed to send test notification. Check Notification URL and network connectivity."
+        return 1
+    fi
+}
+
 run_backup() {
     JOB_ID="$1"
     
@@ -956,16 +1094,22 @@ run_backup() {
         fi
     fi
 
-    SETTINGS=$(sqlite3 "$DB_FILE" "SELECT backup_path, notify_url, log_path FROM settings LIMIT 1;")
-    IFS="|" read -r BACKUP_PATH NOTIFY_URL LOG_PATH <<< "$SETTINGS"
+    SETTINGS=$(sqlite3 "$DB_FILE" "SELECT backup_path, notify_url, log_path, notify_mode FROM settings LIMIT 1;")
+    IFS="|" read -r BACKUP_PATH NOTIFY_URL LOG_PATH NOTIFY_MODE <<< "$SETTINGS"
 
     if [ -z "$LOG_PATH" ]; then
         LOG_PATH="/tmp"
         sqlite3 "$DB_FILE" "UPDATE settings SET log_path = '$LOG_PATH';"
     fi
 
+    if [ "$NOTIFY_MODE" != "all" ] && [ "$NOTIFY_MODE" != "errors" ]; then
+        NOTIFY_MODE="all"
+        sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = '$NOTIFY_MODE';"
+    fi
+
     LOGFILE="$LOG_PATH"/"$JOB_ID".log
     current_date=$(date +%Y%m%d_%H%M%S)
+    ERROR_OCCURRED=0
     
     if [ -f "$LOGFILE" ]; then
         rm "$LOGFILE"
@@ -977,12 +1121,20 @@ run_backup() {
     echo "Starting Backup for $NAME at $current_date..."
 
     BACKUP_DIR="$BACKUP_PATH/$NAME"
-    mkdir -p $BACKUP_DIR
+    if ! mkdir -p "$BACKUP_DIR"; then
+        echo "Failed to create backup directory: $BACKUP_DIR"
+        ERROR_OCCURRED=1
+    fi
+
     if [ -f "$BACKUP_DIR/$NAME-latest.img" ]; then
         echo -e "${GREEN}[STEP 0]${NC} Creating snapshot of latest backup..."
-        cp "$BACKUP_DIR/$NAME-latest.img" $BACKUP_DIR/$NAME-$current_date.img
+        if ! cp "$BACKUP_DIR/$NAME-latest.img" "$BACKUP_DIR/$NAME-$current_date.img"; then
+            echo "Failed to create snapshot copy for $NAME."
+            ERROR_OCCURRED=1
+        fi
         echo -e "${GREEN}   ✔ Done${NC}"
     fi
+
     EXCLUDE_ARGS=( $(generate_rsync_exclude_args "$JOB_ID") )
     if [ "$SSH_KEY" -eq 1 ]; then
         /bin/bash "$SCRIPT_DIR/job.sh" \
@@ -996,15 +1148,34 @@ run_backup() {
           "$PASSWORD" "${EXCLUDE_ARGS[@]}"
     fi
 
-    cleanup_old_backups "$BACKUP_DIR" "$MAX_BACKUPS"
+    if [ $? -ne 0 ]; then
+        echo "Backup job execution failed for client $NAME (job $JOB_ID)."
+        ERROR_OCCURRED=1
+    fi
 
-    if [ -s "$LOGFILE" ]; then
-        MESSAGE=$(<"$LOGFILE")
-        JSON_PAYLOAD=$(jq -n --arg message "$MESSAGE" '{_message: $message}')
-        curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d "$JSON_PAYLOAD" "$NOTIFY_URL" 2>/dev/null
+    cleanup_old_backups "$BACKUP_DIR" "$MAX_BACKUPS"
+    if [ $? -ne 0 ]; then
+        echo "Cleanup failed for backup directory $BACKUP_DIR."
+        ERROR_OCCURRED=1
+    fi
+
+    SHOULD_NOTIFY=0
+    if [ "$NOTIFY_MODE" = "all" ]; then
+        SHOULD_NOTIFY=1
+    elif [ "$NOTIFY_MODE" = "errors" ] && [ "$ERROR_OCCURRED" -eq 1 ]; then
+        SHOULD_NOTIFY=1
+    fi
+
+    if [ "$SHOULD_NOTIFY" -eq 1 ] && [ -n "$NOTIFY_URL" ] && [ -s "$LOGFILE" ]; then
+        RAW_MESSAGE=$(<"$LOGFILE")
+        send_notification "$NOTIFY_URL" "$RAW_MESSAGE"
     fi
 
     echo "Backup Done."
+
+    if [ "$ERROR_OCCURRED" -eq 1 ]; then
+        exit 1
+    fi
 
     exit 0
 }
@@ -1131,6 +1302,12 @@ fi
 # Check if script is called with `--auto`
 if [[ "$1" == "--auto" ]]; then
     run_backup $2
+fi
+
+# Send test notification with current settings
+if [[ "$1" == "--test-notify" ]]; then
+    test_notify "$2" "$3"
+    exit $?
 fi
 
 # Show main menu

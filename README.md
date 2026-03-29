@@ -23,7 +23,7 @@ Since I don't always have direct physical access, I wanted to enable remote back
 - Per-client configuration: hostname/IP, user, password (or SSH key mode), and per-job excludes.
 - Job scheduling: cron entries are automatically updated based on configured backup jobs.
 - TUI management: add/edit/delete clients and backup jobs using `run.sh` interactive menu.
-- Simple notification: optional POST of job log output to a configured notify URL.
+- Notification system: optional POST of job log output to a configured notify URL. ANSI color codes are stripped before sending.
 - Individual and ad hoc runs are available by running the `job.sh`.
 
 # Requirements
@@ -86,6 +86,34 @@ There are several things to consider for backups. Especially permissions. But do
 ## Automatic scheduling
 
 When you add backup jobs via the TUI, the script will update `crontab` to run `run.sh --auto <job-id>` at the configured time. Ensure cron runs under a user with the right permissions (root for example).
+
+## Notification behavior
+
+- In Settings, `Notification URL` defines the destination endpoint.
+- In Settings, `Notification Mode` defines when messages are sent:
+	- `All Logs`: sends after each run.
+	- `Only Errors`: sends only when the run reports errors.
+- Payload format is JSON with key `_message`.
+
+You can also test notifications directly from CLI:
+
+```bash
+# Uses current Notification Mode with a successful-state simulation
+./run.sh --test-notify 1
+
+# Simulate an error run to test "Only Errors" mode
+./run.sh --test-notify 1 error
+```
+
+Available non-interactive options in `run.sh`:
+
+```bash
+# Run a configured job directly
+./run.sh --auto <job-id>
+
+# Send a test notification for a job (state: ok|error)
+./run.sh --test-notify <job-id> [ok|error]
+```
 
 ## Configuration and storage
 
