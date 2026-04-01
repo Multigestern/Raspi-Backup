@@ -164,12 +164,17 @@ CREATE TABLE IF NOT EXISTS settings (
     master_key_encrypted TEXT,
     notify_mode TEXT DEFAULT 'all'
 );
-INSERT OR IGNORE INTO settings (id, backup_path, notify_url, log_path, master_key_encrypted, notify_mode) VALUES (1, '/tmp', 'https://example.com', '/tmp', '', 'all');
 EOF
 
-    # Migrations
-    sqlite3 "$DB_FILE" "ALTER TABLE settings ADD COLUMN notify_mode TEXT DEFAULT 'all';" 2>/dev/null
-    sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = 'all' WHERE notify_mode IS NULL OR notify_mode = '';" 2>/dev/null
+    # Only insert default settings if table is empty
+    if [ $(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM settings;" 2>/dev/null) -eq 0 ]; then
+        sqlite3 "$DB_FILE" "INSERT INTO settings (backup_path, notify_url, log_path, master_key_encrypted, notify_mode) VALUES ('/tmp', 'https://example.com', '/tmp', '', 'all');"
+    fi
+
+    # Ensure all required columns exist for older databases (idempotent)
+    sqlite3 "$DB_FILE" "ALTER TABLE settings ADD COLUMN log_path TEXT DEFAULT '/tmp';" 2>/dev/null || true
+    sqlite3 "$DB_FILE" "ALTER TABLE settings ADD COLUMN notify_mode TEXT DEFAULT 'all';" 2>/dev/null || true
+    sqlite3 "$DB_FILE" "ALTER TABLE settings ADD COLUMN master_key_encrypted TEXT;" 2>/dev/null || true
 
     sqlite3 "$DB_FILE" <<EOF
 CREATE TABLE IF NOT EXISTS global_excludes (
@@ -1189,20 +1194,42 @@ cleanup_old_backups() {
     if [[ "$TOTAL_BACKUPS" -gt "$MAX_BACKUPS" ]]; then
         DELETE_COUNT=$((TOTAL_BACKUPS - MAX_BACKUPS))
 
-        echo "There are $TOTAL_BACKUPS backups, alloewd are $MAX_BACKUPS."
+        echo "There are $TOTAL_BACKUPS backups, allowed are $MAX_BACKUPS."
         echo "Deleting the $DELETE_COUNT oldest backups in $BACKUP_DIR ..."
 
+        # Use temp file instead of pipe to avoid subshell issues with error propagation
+        local temp_file=$(mktemp)
         find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%T@ %p\n' \
             | sort -n \
-            | head -n "$DELETE_COUNT" \
-            | cut -d' ' -f2- \
-            | while read -r file; do
+            | head -n "$DELETE_COUNT" > "$temp_file"
+        
+        local delete_failed=0
+        while IFS= read -r line; do
+            # Extract timestamp and path correctly - handle filenames with spaces
+            local timestamp="${line%% *}"
+            local file="${line#* }"
+            
+            if [ -f "$file" ]; then
                 echo "Deleting: $file"
-                rm -f "$file"
-              done
+                if ! rm -f "$file"; then
+                    echo "Warning: Failed to delete $file"
+                    delete_failed=1
+                fi
+            else
+                echo "Warning: File not found: $file"
+            fi
+        done < "$temp_file"
+        
+        rm -f "$temp_file"
+        
+        if [ $delete_failed -eq 1 ]; then
+            return 1
+        fi
     else
         echo "Nothing to delete – there are only $TOTAL_BACKUPS/$MAX_BACKUPS backups."
     fi
+    
+    return 0
 }
 
 check_and_install_tools() {
