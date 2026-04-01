@@ -147,8 +147,8 @@ rsync_remote() {
       log_error "Error: Partial transfer – some files were not copied (permission denied or other I/O error)"
       return 1 ;;
     11)
-      log_warning "Warning: Some files were not copied due to space constraints"
-      return 0 ;;
+      log_error "No space left on destination filesystem while syncing partition data"
+      return 1 ;;
     *)
       log_error "Error: rsync failed with exit code $rsync_exit"
       return 1 ;;
@@ -351,8 +351,10 @@ if [ ! -f "$OUTPUT_IMAGE" ]; then
       SRC_SIZE=$("${SSH_CMD[@]}" "$REMOTE_HOST" "df -B1 '$MOUNTPOINT'" | awk 'NR==2 {print $3}')
       DST_SIZE=$(blockdev --getsize64 "$LOOP_PART")
       if [ "$SRC_SIZE" -gt "$DST_SIZE" ]; then
-        log_warning "Warning: Source partition ($((SRC_SIZE/1024/1024))MB) is larger than destination ($((DST_SIZE/1024/1024))MB)"
-        echo "         Some files may not be copied due to space constraints"
+        log_error "Source partition used space ($((SRC_SIZE/1024/1024))MB) exceeds destination partition size ($((DST_SIZE/1024/1024))MB)"
+        echo "         Skipping partition /dev/$PART_NAME. Create a new full backup image to resize partitions."
+        BACKUP_ERRORS=$((BACKUP_ERRORS + 1))
+        continue
       fi
     fi
 
