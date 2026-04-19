@@ -626,19 +626,14 @@ edit_job() {
             whiptail --msgbox "Invalid time format. Please use HH:MM (24-hour format)." 10 60
         fi
     done
-    [ $? -ne 0 ] && return
 
     RETENTION=$(whiptail --title "Retention" --inputbox "How many backups do you want to keep?" 15 80 "$MAX_BACKUPS" 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
-    sqlite3 "$DB_FILE" <<EOF
-UPDATE backup_jobs
-    SET disk = "$DISK",
-        max_backups = $RETENTION,
-    schedule = "$SCHEDULE",
-    weekdays = "$NEW_WEEKDAYS"
-WHERE id = $JOB_ID;
-EOF
+    if ! sqlite3 "$DB_FILE" "UPDATE backup_jobs SET disk = '$DISK', max_backups = $RETENTION, schedule = '$SCHEDULE', weekdays = '$NEW_WEEKDAYS' WHERE id = $JOB_ID;"; then
+        whiptail --title "Edit Job" --msgbox "Failed to update backup job. Please try again." 10 60
+        return
+    fi
 
     update_cron
 
