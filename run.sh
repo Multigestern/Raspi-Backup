@@ -10,6 +10,20 @@ FULLPATH="$(realpath "$0")"
 SCRIPT_DIR="$(dirname "$FULLPATH")"
 DB_FILE="$SCRIPT_DIR/backup_clients.db"
 
+migrate_legacy_db_location() {
+    local legacy_db="$PWD/backup_clients.db"
+
+    # Older versions used a relative DB path (current working directory).
+    # If that file exists and the new canonical DB does not, migrate it.
+    if [ ! -f "$DB_FILE" ] && [ -f "$legacy_db" ] && [ "$legacy_db" != "$DB_FILE" ]; then
+        if cp -p "$legacy_db" "$DB_FILE" 2>/dev/null; then
+            echo "Migrated legacy database from $legacy_db to $DB_FILE"
+        else
+            echo "Warning: Could not migrate legacy database from $legacy_db to $DB_FILE"
+        fi
+    fi
+}
+
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 # Encryption helpers
@@ -440,6 +454,7 @@ delete_client() {
     CLIENT_NAME=$(sqlite3 "$DB_FILE" "SELECT name FROM clients WHERE id = $CLIENT_ID;")
 
     if whiptail --title "Delete Client" --yesno "Are you sure you want to delete the client '$CLIENT_NAME'?" 10 60; then
+        sqlite3 "$DB_FILE" "DELETE FROM job_excludes WHERE job_id IN (SELECT id FROM backup_jobs WHERE client_id = $CLIENT_ID);"
         sqlite3 "$DB_FILE" "DELETE FROM backup_jobs WHERE client_id = $CLIENT_ID;"
         sqlite3 "$DB_FILE" "DELETE FROM clients WHERE id = $CLIENT_ID;"
         update_cron
@@ -516,6 +531,7 @@ manage_job_action() {
 
     MENU_OPTIONS=(
         "Edit" "Edit the job details."
+        "Job Excludes" "Manage exclude paths for this job."
         "Delete" "Delete the job from the database."
     )
 
@@ -617,7 +633,8 @@ edit_job() {
 
     sqlite3 "$DB_FILE" <<EOF
 UPDATE backup_jobs
-SET max_backups = $RETENTION,
+    SET disk = "$DISK",
+        max_backups = $RETENTION,
     schedule = "$SCHEDULE",
     weekdays = "$NEW_WEEKDAYS"
 WHERE id = $JOB_ID;
@@ -632,6 +649,7 @@ delete_job() {
     JOB_ID="$1"
 
     if whiptail --title "Delete Job" --yesno "Are you sure you want to delete this job?" 10 60; then
+        sqlite3 "$DB_FILE" "DELETE FROM job_excludes WHERE job_id = $JOB_ID;"
         sqlite3 "$DB_FILE" "DELETE FROM backup_jobs WHERE id = $JOB_ID;"
         update_cron
 
@@ -920,6 +938,53 @@ is_valid_ip() {
         return 0
     else
         return 1
+    fi
+}
+
+check_and_repair_db_consistency() {
+    local orphaned_job_excludes=0
+    local orphaned_backup_jobs=0
+
+    # Historical settings migrations (v1.2.0 -> v1.2.5+), idempotent.
+    sqlite3 "$DB_FILE" "ALTER TABLE settings ADD COLUMN log_path TEXT DEFAULT '/tmp';" 2>/dev/null || true
+    sqlite3 "$DB_FILE" "ALTER TABLE settings ADD COLUMN notify_mode TEXT DEFAULT 'all';" 2>/dev/null || true
+    sqlite3 "$DB_FILE" "ALTER TABLE settings ADD COLUMN master_key_encrypted TEXT;" 2>/dev/null || true
+
+    local settings_count=0
+    settings_count=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM settings;" 2>/dev/null)
+    if [ -z "$settings_count" ]; then
+        settings_count=0
+    fi
+
+    if [ "$settings_count" -eq 0 ]; then
+        sqlite3 "$DB_FILE" "INSERT INTO settings (backup_path, notify_url, log_path, master_key_encrypted, notify_mode) VALUES ('/tmp', 'https://example.com', '/tmp', '', 'all');"
+    fi
+
+    # Backfill defaults for upgraded databases with empty or NULL values.
+    sqlite3 "$DB_FILE" "UPDATE settings SET backup_path = '/tmp' WHERE backup_path IS NULL OR backup_path = '';" 2>/dev/null || true
+    sqlite3 "$DB_FILE" "UPDATE settings SET notify_url = 'https://example.com' WHERE notify_url IS NULL OR notify_url = '';" 2>/dev/null || true
+    sqlite3 "$DB_FILE" "UPDATE settings SET log_path = '/tmp' WHERE log_path IS NULL OR log_path = '';" 2>/dev/null || true
+    sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = 'all' WHERE notify_mode IS NULL OR notify_mode = '' OR notify_mode NOT IN ('all','errors');" 2>/dev/null || true
+    sqlite3 "$DB_FILE" "UPDATE settings SET master_key_encrypted = '' WHERE master_key_encrypted IS NULL;" 2>/dev/null || true
+
+    # Remove excludes that reference jobs which no longer exist.
+    orphaned_job_excludes=$(sqlite3 "$DB_FILE" <<'SQL'
+DELETE FROM job_excludes
+WHERE job_id NOT IN (SELECT id FROM backup_jobs);
+SELECT changes();
+SQL
+)
+
+    # Remove jobs that reference clients which no longer exist.
+    orphaned_backup_jobs=$(sqlite3 "$DB_FILE" <<'SQL'
+DELETE FROM backup_jobs
+WHERE client_id NOT IN (SELECT id FROM clients);
+SELECT changes();
+SQL
+)
+
+    if [ "${orphaned_job_excludes:-0}" -gt 0 ] || [ "${orphaned_backup_jobs:-0}" -gt 0 ]; then
+        echo "Database consistency repair: removed ${orphaned_job_excludes:-0} orphaned job_excludes and ${orphaned_backup_jobs:-0} orphaned backup_jobs entries."
     fi
 }
 
@@ -1317,8 +1382,13 @@ check_and_install_tools() {
 # Check and install required tools
 check_and_install_tools
 
+# Migrate databases created by older versions that used relative DB paths.
+migrate_legacy_db_location
+
 # Initialize the database
 initialize_db
+
+check_and_repair_db_consistency
 
 # Load master key after database initialization
 if ! load_master_key_from_db; then
