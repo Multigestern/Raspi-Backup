@@ -10,6 +10,27 @@ FULLPATH="$(realpath "$0")"
 SCRIPT_DIR="$(dirname "$FULLPATH")"
 DB_FILE="$SCRIPT_DIR/backup_clients.db"
 
+# Execute a sqlite3 statement with error handling.
+# On failure, prints the error to the terminal and shows a whiptail hint.
+# Usage: db_exec "SQL statement" "Operation description"
+# Returns 0 on success, 1 on failure.
+db_exec() {
+    local sql="$1"
+    local description="${2:-Database operation}"
+    local db_error
+
+    db_error=$(sqlite3 "$DB_FILE" "$sql" 2>&1)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}[DB ERROR]${NC} $description" >&2
+        echo -e "${RED}  SQL:${NC} $sql" >&2
+        echo -e "${RED}  Error:${NC} $db_error" >&2
+        whiptail --title "Database Error" --msgbox "$description failed.\n\nSee terminal output for details." 12 60
+        return 1
+    fi
+    echo "$db_error"
+    return 0
+}
+
 migrate_legacy_db_location() {
     local legacy_db="$PWD/backup_clients.db"
 
@@ -369,10 +390,7 @@ add_client() {
         STORED_PASSWORD=""
     fi
 
-    sqlite3 "$DB_FILE" <<EOF
-INSERT INTO clients (name, ip, username, password, ssh_key)
-VALUES ("$NAME", "$NEW_IP", "$USERNAME", "$STORED_PASSWORD", $USE_SSH_KEY);
-EOF
+    db_exec "INSERT INTO clients (name, ip, username, password, ssh_key) VALUES ('$NAME', '$NEW_IP', '$USERNAME', '$STORED_PASSWORD', $USE_SSH_KEY);" "Add client '$NAME'" || return
 
     whiptail --title "Add Client" --msgbox "Client added successfully." 10 60
 }
@@ -436,15 +454,7 @@ edit_client() {
         USE_SSH_KEY=$SSH_KEY
     fi
 
-    sqlite3 "$DB_FILE" <<EOF
-UPDATE clients
-SET name = "$NEW_NAME",
-    ip = "$NEW_IP",
-    username = "$NEW_USERNAME",
-    password = "$STORED_PASSWORD",
-    ssh_key = $USE_SSH_KEY
-WHERE id = $CLIENT_ID;
-EOF
+    db_exec "UPDATE clients SET name = '$NEW_NAME', ip = '$NEW_IP', username = '$NEW_USERNAME', password = '$STORED_PASSWORD', ssh_key = $USE_SSH_KEY WHERE id = $CLIENT_ID;" "Update client '$NEW_NAME'" || return
 
     whiptail --title "Edit Client" --msgbox "Client updated successfully." 10 60
 }
@@ -454,9 +464,7 @@ delete_client() {
     CLIENT_NAME=$(sqlite3 "$DB_FILE" "SELECT name FROM clients WHERE id = $CLIENT_ID;")
 
     if whiptail --title "Delete Client" --yesno "Are you sure you want to delete the client '$CLIENT_NAME'?" 10 60; then
-        sqlite3 "$DB_FILE" "DELETE FROM job_excludes WHERE job_id IN (SELECT id FROM backup_jobs WHERE client_id = $CLIENT_ID);"
-        sqlite3 "$DB_FILE" "DELETE FROM backup_jobs WHERE client_id = $CLIENT_ID;"
-        sqlite3 "$DB_FILE" "DELETE FROM clients WHERE id = $CLIENT_ID;"
+        db_exec "BEGIN; DELETE FROM job_excludes WHERE job_id IN (SELECT id FROM backup_jobs WHERE client_id = $CLIENT_ID); DELETE FROM backup_jobs WHERE client_id = $CLIENT_ID; DELETE FROM clients WHERE id = $CLIENT_ID; COMMIT;" "Delete client '$CLIENT_NAME'" || return
         update_cron
         whiptail --title "Delete Client" --msgbox "Client '$CLIENT_NAME' deleted successfully." 10 60
     else
@@ -584,10 +592,7 @@ add_job() {
     RETENTION=$(whiptail --title "Retention" --inputbox "How many backups do you want to keep?" 15 80 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
-    sqlite3 "$DB_FILE" <<EOF
-INSERT INTO backup_jobs (client_id, disk, schedule, max_backups, weekdays)
-VALUES ($CLIENT_ID, "$DISK", "$SCHEDULE", $RETENTION, "$WEEKDAYS");
-EOF
+    db_exec "INSERT INTO backup_jobs (client_id, disk, schedule, max_backups, weekdays) VALUES ($CLIENT_ID, '$DISK', '$SCHEDULE', $RETENTION, '$WEEKDAYS');" "Add backup job" || return
 
     update_cron
 
@@ -626,14 +631,10 @@ edit_job() {
             whiptail --msgbox "Invalid time format. Please use HH:MM (24-hour format)." 10 60
         fi
     done
-
     RETENTION=$(whiptail --title "Retention" --inputbox "How many backups do you want to keep?" 15 80 "$MAX_BACKUPS" 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
-    if ! sqlite3 "$DB_FILE" "UPDATE backup_jobs SET disk = '$DISK', max_backups = $RETENTION, schedule = '$SCHEDULE', weekdays = '$NEW_WEEKDAYS' WHERE id = $JOB_ID;"; then
-        whiptail --title "Edit Job" --msgbox "Failed to update backup job. Please try again." 10 60
-        return
-    fi
+    db_exec "UPDATE backup_jobs SET disk = '$DISK', max_backups = $RETENTION, schedule = '$SCHEDULE', weekdays = '$NEW_WEEKDAYS' WHERE id = $JOB_ID;" "Update backup job #$JOB_ID" || return
 
     update_cron
 
@@ -644,15 +645,9 @@ delete_job() {
     JOB_ID="$1"
 
     if whiptail --title "Delete Job" --yesno "Are you sure you want to delete this job?" 10 60; then
-        sqlite3 "$DB_FILE" "DELETE FROM job_excludes WHERE job_id = $JOB_ID;"
-        sqlite3 "$DB_FILE" "DELETE FROM backup_jobs WHERE id = $JOB_ID;"
+        db_exec "BEGIN; DELETE FROM job_excludes WHERE job_id = $JOB_ID; DELETE FROM backup_jobs WHERE id = $JOB_ID; COMMIT;" "Delete backup job #$JOB_ID" || return
         update_cron
-
-        if [ $? -eq 0 ]; then
-            whiptail --title "Delete Job" --msgbox "Backup job deleted successfully." 10 60
-        else
-            whiptail --title "Delete Job" --msgbox "Failed to delete the backup job. Please try again." 10 60
-        fi
+        whiptail --title "Delete Job" --msgbox "Backup job deleted successfully." 10 60
     else
         whiptail --title "Delete Job" --msgbox "Deletion cancelled." 10 60
     fi
@@ -696,7 +691,7 @@ add_job_exclude() {
     EXCLUDE_PATH=$(whiptail --title "Add Job Exclude" --inputbox "Enter the path to exclude for this job:" 10 60 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
-    sqlite3 "$DB_FILE" "INSERT OR IGNORE INTO job_excludes (job_id, exclude_path) VALUES ($JOB_ID, '$EXCLUDE_PATH');"
+    db_exec "INSERT OR IGNORE INTO job_excludes (job_id, exclude_path) VALUES ($JOB_ID, '$EXCLUDE_PATH');" "Add exclude for job #$JOB_ID" || return
 
     whiptail --title "Add Job Exclude" --msgbox "Exclude added successfully for job $JOB_ID." 10 60
 }
@@ -710,7 +705,7 @@ manage_job_exclude_action() {
     [ $? -ne 0 ] && return
 
     if [ "$ACTION" == "Delete" ]; then
-        sqlite3 "$DB_FILE" "DELETE FROM job_excludes WHERE id = $EXCLUDE_ID;"
+        db_exec "DELETE FROM job_excludes WHERE id = $EXCLUDE_ID;" "Remove job exclude #$EXCLUDE_ID" || return
         whiptail --title "Job Exclude" --msgbox "Exclude path removed successfully." 10 60
     fi
 }
@@ -771,10 +766,7 @@ backup_path() {
         fi
     done
 
-    sqlite3 "$DB_FILE" <<EOF
-UPDATE settings
-SET backup_path = "$BACKUP_PATH";
-EOF
+    db_exec "UPDATE settings SET backup_path = '$BACKUP_PATH';" "Update backup path" || return
 
     whiptail --title "Settings" --msgbox "Settings updated successfully." 10 60
 }
@@ -799,10 +791,7 @@ log_path() {
         fi
     done
 
-    sqlite3 "$DB_FILE" <<EOF
-UPDATE settings
-SET log_path = "$LOG_PATH";
-EOF
+    db_exec "UPDATE settings SET log_path = '$LOG_PATH';" "Update log path" || return
 
     update_cron
 
@@ -819,10 +808,7 @@ notification_url() {
     NOTIFICATION_URL=$(whiptail --title "Settings" --inputbox "Enter the notification URL:" 10 60 "$NOTIFICATION_URL" 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
-    sqlite3 "$DB_FILE" <<EOF
-UPDATE settings
-SET notify_url = "$NOTIFICATION_URL";
-EOF
+    db_exec "UPDATE settings SET notify_url = '$NOTIFICATION_URL';" "Update notification URL" || return
 
     whiptail --title "Settings" --msgbox "Settings updated successfully." 10 60
 }
@@ -846,14 +832,17 @@ notification_mode() {
         "Only Errors" "Send notifications only if the backup run had errors." 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
+    local NEW_MODE
     case "$CHOICE" in
         "All Logs")
-            sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = 'all';"
+            NEW_MODE="all"
             ;;
         "Only Errors")
-            sqlite3 "$DB_FILE" "UPDATE settings SET notify_mode = 'errors';"
+            NEW_MODE="errors"
             ;;
     esac
+
+    db_exec "UPDATE settings SET notify_mode = '$NEW_MODE';" "Update notification mode" || return
 
     whiptail --title "Notification Mode" --msgbox "Notification mode updated successfully." 10 60
 }
@@ -894,10 +883,7 @@ add_global_exclude() {
     EXCLUDE_PATH=$(whiptail --title "Add Global Exclude" --inputbox "Enter the path to exclude:" 10 60 3>&1 1>&2 2>&3)
     [ $? -ne 0 ] && return
 
-    sqlite3 "$DB_FILE" <<EOF
-INSERT OR IGNORE INTO global_excludes (exclude_path)
-VALUES ("$EXCLUDE_PATH");
-EOF
+    db_exec "INSERT OR IGNORE INTO global_excludes (exclude_path) VALUES ('$EXCLUDE_PATH');" "Add global exclude" || return
 
     whiptail --title "Add Global Exclude" --msgbox "Global exclude added successfully." 10 60
 }
@@ -911,7 +897,7 @@ manage_global_exclude_action() {
     [ $? -ne 0 ] && return
 
     if [ "$ACTION" == "Delete" ]; then
-        sqlite3 "$DB_FILE" "DELETE FROM global_excludes WHERE id = $EXCLUDE_ID;"
+        db_exec "DELETE FROM global_excludes WHERE id = $EXCLUDE_ID;" "Remove global exclude #$EXCLUDE_ID" || return
         whiptail --title "Global Exclude" --msgbox "Exclude path removed successfully." 10 60
     fi
 }
