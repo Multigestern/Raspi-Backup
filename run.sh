@@ -1037,7 +1037,25 @@ send_notification() {
     local json_payload
     json_payload=$(jq -n --arg message "$message" '{_message: $message}')
 
-    curl -s -o /dev/null -X POST -H 'Content-Type: application/json' -d "$json_payload" "$notify_url" 2>/dev/null
+    local http_code curl_exit curl_err curl_err_file
+    curl_err_file=$(mktemp)
+    http_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+        -X POST -H 'Content-Type: application/json' -d "$json_payload" "$notify_url" 2>"$curl_err_file")
+    curl_exit=$?
+    curl_err=$(<"$curl_err_file")
+    rm -f "$curl_err_file"
+
+    if [ "$curl_exit" -ne 0 ]; then
+        echo "Notification failed: could not reach $notify_url (curl exit code $curl_exit${curl_err:+: $curl_err})" >&2
+        return 1
+    fi
+
+    if [[ "$http_code" != 2[0-9][0-9] ]]; then
+        echo "Notification failed: $notify_url responded with HTTP $http_code" >&2
+        return 1
+    fi
+
+    return 0
 }
 
 test_notify() {
@@ -1219,7 +1237,9 @@ run_backup() {
 
     if [ "$SHOULD_NOTIFY" -eq 1 ] && [ -n "$NOTIFY_URL" ] && [ -s "$LOGFILE" ]; then
         RAW_MESSAGE=$(<"$LOGFILE")
-        send_notification "$NOTIFY_URL" "$RAW_MESSAGE"
+        if send_notification "$NOTIFY_URL" "$RAW_MESSAGE"; then
+            echo "Notification sent successfully to $NOTIFY_URL"
+        fi
     fi
 
     echo "Backup Done."
